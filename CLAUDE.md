@@ -14,12 +14,23 @@ audio.
 ```sh
 uv sync                                  # install; run after touching pyproject.toml
 uv run faceless <subcommand> ...         # run the CLI
-uv run python -m compileall -q src/faceless   # syntax check
+uv run pytest                            # unit tests - fast, no network
+uv run pytest -m integration             # opt-in checks against real services
+uv run pytest tests/test_match.py -k reuse -x   # one module / one test
+uv run python -m compileall -q src/faceless     # syntax check
 ```
 
-There is **no test suite and no linter configured**. Verification in this project
-is empirical: run the CLI against a real video and inspect the artifacts. The
-checks that have actually caught bugs here:
+**Unit tests never touch the network.** `tests/conftest.py` installs an autouse
+fixture that raises on any socket call, so an accidental real request fails
+loudly instead of quietly hammering YouTube from a test run. Mock at the
+boundary instead: `yt_dlp.YoutubeDL`, `urllib.request.urlopen` (Ollama, Pexels),
+`subprocess.run` (ffmpeg). Anything that genuinely needs a live service is
+marked `@pytest.mark.integration` and deselected by default; `--strict-markers`
+is on, so a typo'd marker is an error rather than a test that quietly runs for
+real. There is **no linter configured**.
+
+Tests cover the pure logic and the boundaries. They do not cover whether the
+output *looks* right, so the empirical checks below still matter:
 
 ```sh
 # scene/segment sanity - contiguity and coverage are the invariants that matter
@@ -86,8 +97,15 @@ find ──► grab ──► meta.json + .vtt + .mp4 ──► harvest ──�
 | `llm.py` | Ollama client; schema-constrained JSON only |
 | `match.py` | Lexical prefilter + LLM rerank |
 | `render.py` | ffmpeg fit/concat/mux |
-| `remix.py` | Orchestrates `harvest` and `remix` |
-| `cli.py` | argparse wiring for all five subcommands |
+| `remix.py` | Orchestrates `harvest`, `remix`, and `reset` |
+| `cli.py` | argparse wiring for all six subcommands |
+
+Subcommands: `find`, `grab`, `harvest`, `remix`, `library`, `reset`. Tests live
+in `tests/`, one module per source module plus `test_harness.py` (which verifies
+the no-network guard) and `test_integration.py` (opt-in, real services).
+
+Outputs are `remixes/<id>.remix.mp4`, or `<id>.remix.<source>.mp4` when
+`--source` is set, so a filtered run never clobbers an unfiltered one.
 
 ### Invariants the design leans on
 
@@ -195,21 +213,61 @@ valid - `pexels.USER_AGENT` exists for that reason. Its documented `quality`
 field also comes back `null` in practice, so renditions are selected by
 dimensions.
 
-## Known limitation
+## State of the project
 
-YouTube-sourced clips are cut from *finished* Shorts, so most carry the source's
-burned-in captions - words that now contradict our narration. It is the most
-visible flaw in such a remix and is inherent to that footage source, not a bug.
-`remix --source pexels` avoids it entirely (verified: a side-by-side on the same
-target had captions on most YouTube shots and none on the Pexels ones). Removing
-text after the fact needs per-frame detection plus inpainting and is not
-implemented.
+The pipeline works end to end and has been verified on real videos: a clean
+`reset` → `grab` → `harvest --source pexels` → `remix --source pexels` run
+produced `remixes/W_mE_LdGA9g.remix.pexels.mp4` at 42.37s against a 42.39s
+source, audio bit-for-bit unchanged (mean -17.1 dB in both), all seven segments
+matched, and no burned-in captions in any frame.
+
+What is **not** done, roughly in the order it would pay off:
+
+1. **Captions land about one cue late** - see the open defect below. Most likely
+   cause of narration not lining up with the picture.
+2. **Scene detection misses some cuts** on softer transitions. `--scene-threshold`
+   below 27 is the lever; nobody has swept it.
+3. **Stock footage is tonally wrong for dramatic narration.** Pexels skews calm:
+   a script about a lion being thrown by buffalo gets lions dozing. The subject
+   matches, the action never does. No fix attempted.
+4. **No burned-in captions on output.** Deliberately out of scope for v1; these
+   Shorts normally have them.
+5. **Harvest is manual.** `library --gaps` prints exactly what to harvest next,
+   but nothing feeds that back into `harvest` automatically.
+
+## Known limitations
+
+**Captions land one cue late (open defect).** `subtitles._parse_blocks` treats a
+whitespace-only line as the end of a cue's text. YouTube writes exactly such a
+line between the timing line and the karaoke text, so the first cue yields no
+text and its words are picked up from the *next* cue instead - roughly two
+seconds later than they were spoken. Nothing is lost (rolling captions repeat
+each line) but every caption is late, which drags narration one shot behind the
+picture and therefore degrades matching. `tests/test_subtitles.py::
+test_whitespace_only_line_ends_the_cue_text` pins the current behaviour so the
+fix is a deliberate act. The fix is one line - break only on a genuinely empty
+line, per the WebVTT spec, where a line containing a space is *not* empty - but
+it shifts every transcript timing and changes remix output, so re-verify the
+end-to-end run after changing it.
+
+**YouTube-sourced clips carry burned-in captions.** They are cut from *finished*
+Shorts, so most arrive with the source's own words on screen, contradicting our
+narration. It is the most visible flaw in such a remix and is inherent to that
+footage source, not a bug. `remix --source pexels` avoids it entirely (verified:
+a side-by-side on the same target had captions on most YouTube shots and none on
+the Pexels ones). Removing text after the fact needs per-frame detection plus
+inpainting and is not implemented.
 
 ## Conventions
 
 - Typed exceptions per module (`SearchError`, `GrabError`, `SceneDetectionError`,
-  `LibraryError`, `LLMError`, `RenderError`), all caught in `cli.main` and
-  printed as `faceless: <message>` with a hint for throttling errors.
+  `LibraryError`, `LLMError`, `RenderError`, `PexelsError`), all caught in
+  `cli.main` and printed as `faceless: <message>`. The hint is matched to the
+  service that failed - a Pexels 403 has nothing to do with YouTube cookies.
+- `reset` is the only destructive command. It prints what it will delete, asks
+  for confirmation, treats an unanswered prompt as "no", takes `--yes` for
+  scripting, and reports paths it could not remove rather than claiming success.
+  A database viewer attached to `library.db` will block deletion on Windows.
 - Every command supports `--json`; progress goes to **stderr** so stdout stays
   pipeable. `cli._force_utf8` is required - Windows consoles mangle non-ASCII
   video titles otherwise.

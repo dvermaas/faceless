@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,61 @@ class HarvestResult:
             "failed": [{"id": vid, "error": err} for vid, err in self.failed],
             "clips": [clip.to_dict() for clip in self.added],
         }
+
+
+@dataclass(slots=True)
+class ResetTarget:
+    name: str
+    path: Path
+    files: int
+    bytes: int
+
+    @property
+    def megabytes(self) -> float:
+        return self.bytes / 1_000_000
+
+
+def inspect_reset(paths: dict[str, Path]) -> list[ResetTarget]:
+    """Measure what a reset would delete, without deleting anything."""
+    targets: list[ResetTarget] = []
+    for name, path in paths.items():
+        if not path.exists():
+            continue
+        files = [item for item in path.rglob("*") if item.is_file()]
+        targets.append(
+            ResetTarget(
+                name=name,
+                path=path,
+                files=len(files),
+                bytes=sum(item.stat().st_size for item in files),
+            )
+        )
+    return targets
+
+
+def reset(targets: list[ResetTarget]) -> list[str]:
+    """Delete the output directories outright, returning anything that survived.
+
+    Failures are reported rather than ignored: a destructive command that claims
+    to have removed hundreds of megabytes while the database is still sitting
+    there is worse than one that fails loudly. The usual cause on Windows is
+    something holding `library.db` open - a database viewer attached to it, for
+    instance - and the fix is to close that, not to work around it here.
+    """
+    for target in targets:
+        resolved = target.path.resolve()
+        if resolved.parent == resolved or resolved == Path.cwd().resolve():
+            raise LibraryError(f"refusing to delete {resolved} - that is not an output directory")
+
+    failed: list[str] = []
+    for target in targets:
+        try:
+            shutil.rmtree(target.path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            failed.append(f"{target.path}: {exc.strerror or exc}")
+    return failed
 
 
 def _meta_for(video: Path) -> dict:

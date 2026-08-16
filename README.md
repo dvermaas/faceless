@@ -46,6 +46,18 @@ to disk, so it cannot end up in a commit.
 Output lands in `downloads/` (sources), `library/` (clips), and `remixes/`
 (finished videos). All three are gitignored - they are large and reproducible.
 
+## Tests
+
+```sh
+uv run pytest                  # ~100 unit tests, about a second, no network
+uv run pytest -m integration   # opt-in: checks ffmpeg, Ollama, Pexels and YouTube
+```
+
+Unit tests mock every downstream service and a fixture fails the run if anything
+opens a socket, so the suite never sends traffic to YouTube or Pexels. The
+integration tests do talk to them; they are deselected by default and skip
+individually when a prerequisite (a key, a model, a binary) is missing.
+
 ## Commands
 
 ### `faceless find <query>`
@@ -287,6 +299,22 @@ Clips from the video being rebuilt are never reused. Start with `--dry-run`: it
 prints each segment, the query derived from its narration, the chosen clip and
 why, and renders nothing — it is the cheap loop for judging match quality.
 
+### `faceless reset`
+
+Deletes the clip library, the downloads and the rendered remixes, to start clean.
+
+```sh
+faceless reset                      # shows what it will delete, then asks
+faceless reset --only library       # just the clip library
+faceless reset --yes                # no prompt, for scripts
+```
+
+It prints the file count and size per directory before asking, and treats an
+unanswered prompt as a no — so piping it into a script without `--yes` deletes
+nothing. If a path cannot be removed it says which and exits non-zero rather
+than reporting a success it did not achieve. A database viewer attached to
+`library/library.db` will block that deletion on Windows; close it and re-run.
+
 ### Burned-in captions, and what to do about them
 
 Clips harvested from YouTube are cut from *finished* Shorts, so they inherit
@@ -307,6 +335,14 @@ if you want YouTube's visual style without the text, are cropping the caption
 band (position varies by channel, and you lose picture) or screening clips for
 on-screen text at harvest time and keeping only the clean ones. Neither is
 implemented.
+
+### Known: narration runs about a shot behind
+
+Captions are attributed roughly one cue later than they were spoken, because the
+VTT parser treats YouTube's whitespace-only separator line as the end of a cue.
+Nothing is lost, but everything is late, which is the most likely reason a shot
+sometimes matches the *previous* sentence. See CLAUDE.md → Known limitations for
+the one-line fix and why it has not been applied yet.
 
 ### Local model
 

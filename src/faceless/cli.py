@@ -14,7 +14,7 @@ from .download import DEFAULT_LANGS, DEFAULT_TEMPLATE, GrabError, grab
 from .library import Library, LibraryError
 from .llm import DEFAULT_MODEL, LLMError
 from .pexels import PexelsError
-from .remix import SOURCES, harvest, remix
+from .remix import SOURCES, harvest, inspect_reset, remix, reset
 from .render import RenderError
 from .scenes import DEFAULT_THRESHOLD, SceneDetectionError
 from .search import SearchError, search
@@ -268,6 +268,54 @@ def cmd_library(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reset(args: argparse.Namespace) -> int:
+    chosen = {"library": args.library, "downloads": args.downloads, "remixes": args.remixes}
+    if args.only:
+        chosen = {name: path for name, path in chosen.items() if name in args.only}
+
+    targets = inspect_reset(chosen)
+    if not targets:
+        print("nothing to reset - none of those directories exist")
+        return 0
+
+    total_files = sum(target.files for target in targets)
+    total_mb = sum(target.megabytes for target in targets)
+    print("this will permanently delete:")
+    for target in targets:
+        print(f"  {target.path}  ({target.files} files, {target.megabytes:.0f}MB)")
+    print(f"  total: {total_files} files, {total_mb:.0f}MB")
+
+    if not args.yes:
+        try:
+            reply = input("type 'yes' to confirm: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            # Nobody there to answer (piped, scripted, CI). An unanswered prompt
+            # is never agreement to delete.
+            print(
+                "\nfaceless: cancelled - nothing deleted. "
+                "Re-run with --yes to confirm without a prompt.",
+                file=sys.stderr,
+            )
+            return 1
+        if reply != "yes":
+            print("cancelled - nothing was deleted")
+            return 1
+
+    failed = reset(targets)
+    if failed:
+        print("faceless: some paths could not be removed:", file=sys.stderr)
+        for problem in failed:
+            print(f"  {problem}", file=sys.stderr)
+        print(
+            "hint: something still holds them open - a database viewer attached "
+            "to library.db will do it. Close it and re-run.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"removed {total_files} files ({total_mb:.0f}MB)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -483,6 +531,32 @@ def build_parser() -> argparse.ArgumentParser:
     library_cmd.add_argument("-n", "--limit", type=int, default=20, metavar="N", help="row limit")
     library_cmd.add_argument("--json", action="store_true", help="emit JSON")
     library_cmd.set_defaults(func=cmd_library)
+
+    reset_cmd = subparsers.add_parser(
+        "reset",
+        help="delete the clip library, downloads and remixes",
+        description=(
+            "Start clean. Shows what will be deleted and asks for confirmation "
+            "first; the clip files and the database are not recoverable afterwards."
+        ),
+    )
+    reset_cmd.add_argument(
+        "--library", default="library", type=Path, metavar="DIR", help="clip library directory"
+    )
+    reset_cmd.add_argument(
+        "--downloads", default="downloads", type=Path, metavar="DIR", help="downloads directory"
+    )
+    reset_cmd.add_argument(
+        "--remixes", default="remixes", type=Path, metavar="DIR", help="rendered output directory"
+    )
+    reset_cmd.add_argument(
+        "--only",
+        nargs="+",
+        choices=("library", "downloads", "remixes"),
+        help="reset only these (default: all three)",
+    )
+    reset_cmd.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
+    reset_cmd.set_defaults(func=cmd_reset)
 
     return parser
 
