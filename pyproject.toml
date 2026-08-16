@@ -1,0 +1,28 @@
+[project]
+name = "faceless"
+version = "0.1.0"
+description = "AI-in-the-loop pipeline for producing YouTube Shorts"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Scene/cut detection. The pyav extra is not optional in practice: decoding
+    # dominates detection time, and PyAV is ~4x faster than the bundled OpenCV
+    # backend for identical results. opencv-python still comes along as a base
+    # requirement and serves as the fallback backend.
+    "scenedetect[pyav]>=0.7.1",
+    # "default" pulls in yt-dlp-ejs, which solves YouTube's JS challenges - without
+    # it media URLs come back 403. curl-cffi supplies a browser impersonation
+    # target; without it YouTube answers caption requests with 429.
+    # A JavaScript runtime (deno, node or bun) must also be on PATH for yt-dlp-ejs,
+    # and ffmpeg is needed to merge separate video/audio streams.
+    "yt-dlp[default,curl-cffi]>=2026.7.4",
+]
+
+[project.scripts]
+faceless = "faceless.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/faceless"]
