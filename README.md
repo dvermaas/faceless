@@ -27,12 +27,21 @@ Three external tools are expected, none of them Python packages:
 - **a JavaScript runtime** (deno, node or bun) - drives `yt-dlp-ejs`, which
   solves YouTube's JS challenges. Without it, media URLs come back `403`.
 - **Ollama** serving on `localhost:11434` with `gemma4:12b` pulled - writes clip
-  descriptions and drives matching. Only `harvest` and `remix` need it; `find`
-  and `grab` work without it.
+  descriptions and drives matching. `find`, `grab`, and `harvest --source pexels`
+  work without it.
 
 ```sh
 ollama pull gemma4:12b
 ```
+
+For Pexels harvesting, set a free API key from <https://www.pexels.com/api/>:
+
+```sh
+export PEXELS_API_KEY=...        # or pass --pexels-key
+```
+
+The key is only ever read from the environment or the flag — nothing writes it
+to disk, so it cannot end up in a commit.
 
 Output lands in `downloads/` (sources), `library/` (clips), and `remixes/`
 (finished videos). All three are gitignored - they are large and reproducible.
@@ -149,13 +158,26 @@ the footage library that rebuilt Shorts are made from.
 
 ### `faceless harvest <query|url>`
 
-Finds Shorts, downloads them, splits each one along its own detected cuts, and
-files every scene as a reusable clip.
+Grows the clip library. Two sources, chosen with `--source`, writing into the
+same library and the same index:
 
 ```sh
-faceless harvest "https://www.youtube.com/channel/UC..." -n 10
-faceless harvest "kitchen tips" -n 5 --json
+faceless harvest "https://www.youtube.com/channel/UC..." -n 10   # --source youtube (default)
+faceless harvest "owl" --source pexels -n 5
 ```
+
+| | `--source youtube` | `--source pexels` |
+|---|---|---|
+| Footage | scenes cut from finished Shorts | clean single-shot stock |
+| Burned-in captions | **yes** - inherited from the source | none |
+| Clip descriptions | inferred by the local model from narration | read from the Pexels URL slug |
+| Needs Ollama | yes | no |
+| Needs captions | yes - videos without them are skipped | no |
+| Cost | slow (download + detect + a model call per clip) | fast (one API call, then downloads) |
+| Limits | YouTube throttles; harvest paces itself | 200 requests/hour |
+
+Use YouTube when you want footage in the visual style of real Shorts, and Pexels
+when you want clean pictures — see the caption limitation below.
 
 Each clip is named for what it shows, so the library is skimmable from the shell:
 
@@ -176,12 +198,59 @@ Clips are normalized on the way in (1080x1920, 30fps, no audio track — only th
 picture is ever reused). Videos with no English captions are skipped: without
 narration there is nothing to describe the clip by.
 
-**On yield:** YouTube's Shorts *search* filter returns very few results for some
-topics — "animal facts" gave 2. A **channel URL** is the far better harvest
+**On YouTube yield:** the Shorts *search* filter returns very few results for
+some topics — "animal facts" gave 2. A **channel URL** is the far better harvest
 source; `https://www.youtube.com/channel/UC.../` returned 15. Note that some
 channels publish Shorts without exposing a shorts tab, and yt-dlp then reports
 no tab at all — use the `channel_url` from a `grab`'s metadata rather than
 guessing a handle.
+
+**On Pexels:** set `PEXELS_API_KEY` (free key at <https://www.pexels.com/api/>)
+or pass `--pexels-key`. Searches ask for portrait orientation and pick the
+rendition nearest 1080x1920, so clips need no reframing. Stock videos run 20-30
+seconds while segments run 2-4, so only the first 10 seconds of each is kept —
+the renderer never uses more. One query yields a handful of clips, so build a
+library by running several:
+
+```sh
+for q in "sea turtle swimming" "polar bear snow" "butterfly flower"; do
+  faceless harvest "$q" --source pexels -n 3
+done
+```
+
+### `faceless library`
+
+The library is a SQLite database (`library/library.db`) plus the clip files
+themselves. Three tables: `sources` (one row per harvested video), `clips` (one
+per file, with an FTS5 full-text index), and `usages` (every match decision ever
+made).
+
+```sh
+faceless library                          # what's in it, and what gets reused
+faceless library --search "owl perched"   # full-text search, BM25 ranked
+faceless library --gaps                   # queries that found nothing
+faceless library --unused --provider pexels
+```
+
+`--gaps` is the useful one. Every remix records why each clip was chosen, so the
+queries that fell through to filler accumulate into a list of what the library is
+missing — a harvest plan the pipeline writes for itself:
+
+```
+3 queries that found nothing (harvest these):
+  1x  black panther and transparent fur
+  1x  lizard basking in the sun
+```
+
+Harvest those and the gap closes. Search also drives matching, so a bigger
+library does not make matching slower — the shortlisting happens in SQLite, not
+by scoring every clip in Python.
+
+Why a database rather than a folder and a JSON index: the old `index.json` was
+rewritten in full after every harvested source (133KB at 181 clips, ~3.6MB at
+5,000), and a crash mid-write would have truncated the whole collection. Rows are
+appended in a transaction instead, and BM25 ranks far better than the token-overlap
+score it replaced. An existing `index.json` is imported automatically on first run.
 
 ### `faceless remix <url|id>`
 
@@ -189,32 +258,55 @@ Rebuilds a video shot for shot: keeps its audio, replaces every shot with a
 library clip matched to what is being said at that moment.
 
 ```sh
-faceless remix "https://youtu.be/VIDEO_ID" --dry-run   # print the plan, render nothing
+faceless remix "https://youtu.be/VIDEO_ID" --dry-run          # print the plan, render nothing
+faceless remix "https://youtu.be/VIDEO_ID" --source pexels    # clean footage only
 faceless remix "https://youtu.be/VIDEO_ID" -o remixes
 ```
 
-Matching runs in two stages. A lexical pass scores every clip by word overlap
-and keeps a shortlist; the local model then picks from the shortlist. The split
-is what keeps it affordable as the library grows — running hundreds of clips
-through a model per segment would dominate the runtime, while word overlap alone
-picks wrong whenever the words differ and the meaning does not.
+`--source` restricts which footage is eligible. `--source pexels` is how you get
+a remix with no burned-in captions; the default `any` draws on the whole library.
+Filtered runs write to `<id>.remix.<source>.mp4` so they do not overwrite an
+unfiltered one — handy for comparing the two.
+
+When a remix uses Pexels footage, the credits its licence requires are printed
+at the end of the run and included under `credits` in `--json`.
+
+Matching runs in stages. SQLite's FTS5 shortlists candidates by BM25; the local
+model then picks from the shortlist, but only when the top two are close — given
+a clear winner it is skipped, because left to rerank freely it will talk itself
+out of an exact match ("not a specific hippopotamus, but a farm with many
+species...").
+
+When full-text search finds *nothing*, the model gets one more job: widening the
+query. Search cannot connect "black panther" to a clip described as "leopard
+resting in natural habitat" — no shared words — so one call turns the query into
+related subjects (leopard, jaguar, big cat) and search runs again. Only if that
+also fails does a segment get filler, and the query is logged as a gap.
 
 Clips from the video being rebuilt are never reused. Start with `--dry-run`: it
 prints each segment, the query derived from its narration, the chosen clip and
 why, and renders nothing — it is the cheap loop for judging match quality.
 
-### Known limitation: harvested clips carry their original captions
+### Burned-in captions, and what to do about them
 
-Harvested footage is cut from *finished* Shorts, not from clean stock. Most of
-these videos burn their own captions into the picture, so a reused clip arrives
-with a word like `HIPPOPOTAMUS` or `BANNED` still on screen — text that belonged
-to the source's narration and now contradicts ours. It is the most visible flaw
-in a rendered remix, and it is inherent to sourcing footage this way rather than
-a bug in the cutting.
+Clips harvested from YouTube are cut from *finished* Shorts, so they inherit
+whatever those creators burned into the picture. A reused clip arrives with a
+word like `HIPPOPOTAMUS` or `BANNED` still on screen — text that belonged to the
+source's narration and now contradicts ours. It is the most visible flaw in a
+YouTube-sourced remix, and it is inherent to that footage, not a bug in the
+cutting.
 
-Three ways out, none implemented yet: crop the caption band (position varies by
-channel, and cropping loses picture), screen clips for on-screen text at harvest
-time and keep only clean ones, or prefer sources that do not burn in captions.
+**`--source pexels` avoids it entirely.** Stock footage carries no on-screen
+text, so the pictures stay clean. Side by side on the same target video, the
+YouTube remix had a caption stamped across most shots; the Pexels remix had none.
+
+Removing text from footage that already has it is the harder road — it needs
+per-frame text detection plus video inpainting, is slow, and leaves smears on
+moving backgrounds. Avoiding the damage beats repairing it. The middle options,
+if you want YouTube's visual style without the text, are cropping the caption
+band (position varies by channel, and you lose picture) or screening clips for
+on-screen text at harvest time and keeping only the clean ones. Neither is
+implemented.
 
 ### Local model
 

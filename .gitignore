@@ -4,6 +4,9 @@
 # video, so none of it belongs in git.
 downloads/
 library/
+*.db
+*.db-wal
+*.db-shm
 remixes/
 
 # Media, wherever it lands
@@ -22,9 +25,13 @@ remixes/
 *.info.json
 *.meta.json
 
-# Cookie exports - these are live session credentials
+# Credentials. Cookie exports are live session tokens; .env would hold
+# PEXELS_API_KEY. Neither belongs in history.
 cookies.txt
 *.cookies
+.env
+.env.*
+!.env.example
 
 # Python
 __pycache__/

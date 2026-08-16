@@ -64,6 +64,16 @@ def render(
     usable = [match for match in matches if match.clip]
     if not usable:
         raise RenderError("no segment matched a clip, so there is nothing to render")
+    # Skipping unmatched segments would shorten the picture, and `-shortest`
+    # would then silently cut the narration off. Refuse instead of shipping a
+    # video that is quietly missing its ending.
+    if len(usable) != len(matches):
+        missing = len(matches) - len(usable)
+        lost = sum(match.segment.duration for match in matches if not match.clip)
+        raise RenderError(
+            f"{missing} of {len(matches)} segments have no clip ({lost:.1f}s). "
+            "Rendering would truncate the audio - harvest more footage first."
+        )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     workdir = Path(tempfile.mkdtemp(prefix="faceless-render-"))

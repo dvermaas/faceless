@@ -11,9 +11,10 @@ from yt_dlp.utils import DownloadError
 
 from . import __version__
 from .download import DEFAULT_LANGS, DEFAULT_TEMPLATE, GrabError, grab
-from .library import LibraryError
+from .library import Library, LibraryError
 from .llm import DEFAULT_MODEL, LLMError
-from .remix import harvest, remix
+from .pexels import PexelsError
+from .remix import SOURCES, harvest, remix
 from .render import RenderError
 from .scenes import DEFAULT_THRESHOLD, SceneDetectionError
 from .search import SearchError, search
@@ -127,11 +128,13 @@ def _progress(args: argparse.Namespace):
 def cmd_harvest(args: argparse.Namespace) -> int:
     result = harvest(
         args.query,
+        source=args.source,
         limit=args.limit,
         library_root=args.library,
         downloads=args.downloads,
         min_duration=args.min_segment,
         model=args.model,
+        pexels_key=args.pexels_key,
         client=_client(args),
         on_progress=_progress(args),
     )
@@ -159,6 +162,7 @@ def cmd_remix(args: argparse.Namespace) -> int:
         min_duration=args.min_segment,
         model=args.model,
         dry_run=args.dry_run,
+        source=args.source,
         client=_client(args),
         on_progress=_progress(args),
     )
@@ -176,10 +180,91 @@ def cmd_remix(args: argparse.Namespace) -> int:
         print(f"  {window}  {match.query[:38]:38}  ->  {match.clip.clip_id}")
         if args.dry_run:
             print(f"{'':16}score {match.score:.2f}  {match.reason[:70]}")
+    if result.credits:
+        # The Pexels licence asks for a link back and a videographer credit.
+        print("  credits (Pexels licence):")
+        for credit in result.credits:
+            print(f"    {credit['author']} - {credit['url']}")
     if result.output:
         print(f"  output    {result.output}")
     elif args.dry_run:
         print("  (dry run - nothing rendered)")
+    return 0
+
+
+def cmd_library(args: argparse.Namespace) -> int:
+    lib = Library(args.library)
+
+    if args.search:
+        found = lib.search(args.search.split(), limit=args.limit, provider=args.provider)
+        if args.json:
+            _print_json([{"clip": c.to_dict(), "score": round(s, 3)} for c, s in found])
+            return 0
+        print(f"{len(found)} matches for {args.search!r}")
+        for clip, score in found:
+            print(f"  {score:5.2f}  {clip.duration:5.2f}s  [{clip.provider:7}]  {clip.clip_id}")
+        return 0
+
+    if args.gaps:
+        # Queries that fell through to filler are exactly what the library is
+        # missing - this list is the next harvest, written by the pipeline.
+        rows = lib.connection.execute(
+            """
+            SELECT query, count(*) AS n, max(used_at) AS last_seen FROM usages
+            WHERE score <= 0 OR reason LIKE 'filler%'
+            GROUP BY lower(query) ORDER BY n DESC, last_seen DESC LIMIT ?
+            """,
+            (args.limit,),
+        ).fetchall()
+        if args.json:
+            _print_json([dict(row) for row in rows])
+            return 0
+        if not rows:
+            print("no gaps recorded - every segment so far found real footage")
+            return 0
+        print(f"{len(rows)} queries that found nothing (harvest these):")
+        for row in rows:
+            print(f"  {row['n']}x  {row['query']}")
+        print("\n  faceless harvest \"<query>\" --source pexels -n 3")
+        return 0
+
+    if args.unused:
+        rows = lib.connection.execute(
+            """
+            SELECT c.clip_key, c.duration, s.provider FROM clips c
+            JOIN sources s ON s.id = c.source_id
+            LEFT JOIN usages u ON u.clip_id = c.id
+            WHERE u.id IS NULL AND (? IS NULL OR s.provider = ?)
+            ORDER BY c.clip_key LIMIT ?
+            """,
+            (args.provider, args.provider, args.limit),
+        ).fetchall()
+        if args.json:
+            _print_json([dict(row) for row in rows])
+            return 0
+        print(f"{len(rows)} clips never used in a remix")
+        for row in rows:
+            print(f"  {row['duration']:5.2f}s  [{row['provider']:7}]  {row['clip_key']}")
+        return 0
+
+    stats = lib.stats()
+    if args.json:
+        _print_json(stats)
+        return 0
+    print(f"{stats['clips']} clips from {stats['sources']} sources, {stats['total_seconds']:.0f}s")
+    for provider, count in sorted(stats["by_provider"].items()):
+        print(f"  {provider:8} {count}")
+    print(f"  used {stats['clips_used']}, never used {stats['clips_never_used']}")
+    top = lib.connection.execute(
+        """
+        SELECT c.clip_key, count(*) AS n FROM usages u
+        JOIN clips c ON c.id = u.clip_id GROUP BY c.id ORDER BY n DESC LIMIT 5
+        """
+    ).fetchall()
+    if top:
+        print("  most reused:")
+        for row in top:
+            print(f"    {row['n']}x  {row['clip_key']}")
     return 0
 
 
@@ -307,16 +392,36 @@ def build_parser() -> argparse.ArgumentParser:
     harvest_cmd = subparsers.add_parser(
         "harvest",
         parents=[common, pipeline],
-        help="grow the clip library from Shorts matching a query",
+        help="grow the clip library from YouTube Shorts or Pexels stock footage",
         description=(
-            "Find Shorts, download them, split them along their own cuts, and file every "
-            "scene as a reusable clip. Already-harvested videos are skipped, so running "
-            "this repeatedly keeps growing the library."
+            "Grow the clip library. --source youtube finds Shorts, downloads them, and "
+            "files every scene as a clip - those carry the source's burned-in captions. "
+            "--source pexels fetches clean single-shot stock instead. Both write to the "
+            "same library, and already-harvested sources are skipped, so running this "
+            "repeatedly keeps growing the collection."
         ),
     )
-    harvest_cmd.add_argument("query", help="search terms, or a channel/playlist URL")
+    harvest_cmd.add_argument(
+        "query", help="search terms; a channel/playlist URL also works for --source youtube"
+    )
+    harvest_cmd.add_argument(
+        "--source",
+        choices=SOURCES,
+        default="youtube",
+        help=(
+            "where footage comes from: youtube cuts clips out of finished Shorts "
+            "(carries their burned-in captions), pexels fetches clean stock "
+            "(needs PEXELS_API_KEY). Default: youtube"
+        ),
+    )
     harvest_cmd.add_argument(
         "-n", "--limit", type=int, default=5, metavar="N", help="videos to harvest (default: 5)"
+    )
+    harvest_cmd.add_argument(
+        "--pexels-key",
+        default=None,
+        metavar="KEY",
+        help="Pexels API key; defaults to the PEXELS_API_KEY environment variable",
     )
     harvest_cmd.add_argument("--json", action="store_true", help="emit JSON describing what was added")
     harvest_cmd.set_defaults(func=cmd_harvest)
@@ -336,12 +441,48 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--out", default="remixes", type=Path, metavar="DIR", help="output directory"
     )
     remix_cmd.add_argument(
+        "--source",
+        choices=("any", *SOURCES),
+        default="any",
+        help=(
+            "restrict footage to one source. `--source pexels` is the way to get "
+            "a remix with no burned-in captions. Default: any"
+        ),
+    )
+    remix_cmd.add_argument(
         "--dry-run",
         action="store_true",
         help="print the shot-by-shot plan and render nothing",
     )
     remix_cmd.add_argument("--json", action="store_true", help="emit JSON describing the rebuild")
     remix_cmd.set_defaults(func=cmd_remix)
+
+    library_cmd = subparsers.add_parser(
+        "library",
+        help="inspect the clip library",
+        description=(
+            "Show what the library holds, full-text search it, or list clips no "
+            "remix has ever used. With no flags, prints a summary."
+        ),
+    )
+    library_cmd.add_argument(
+        "--library", default="library", type=Path, metavar="DIR", help="clip library directory"
+    )
+    library_cmd.add_argument("--search", metavar="TERMS", help="full-text search clip descriptions")
+    library_cmd.add_argument(
+        "--unused",
+        action="store_true",
+        help="list clips never chosen by a remix - the ones earning nothing",
+    )
+    library_cmd.add_argument(
+        "--gaps",
+        action="store_true",
+        help="list queries that found no footage - what to harvest next",
+    )
+    library_cmd.add_argument("--provider", choices=SOURCES, help="restrict to one source")
+    library_cmd.add_argument("-n", "--limit", type=int, default=20, metavar="N", help="row limit")
+    library_cmd.add_argument("--json", action="store_true", help="emit JSON")
+    library_cmd.set_defaults(func=cmd_library)
 
     return parser
 
@@ -369,13 +510,23 @@ def main(argv: list[str] | None = None) -> int:
         GrabError,
         SceneDetectionError,
         LibraryError,
+        PexelsError,
         LLMError,
         RenderError,
         DownloadError,
     ) as exc:
         message = str(exc)
         print(f"faceless: {message}", file=sys.stderr)
-        if "429" in message or "403" in message or "Sign in to confirm" in message:
+        # Match the hint to the service that actually failed - a Pexels 403 has
+        # nothing to do with YouTube cookies.
+        if isinstance(exc, PexelsError):
+            if "429" in message:
+                print(
+                    "hint: Pexels allows 200 requests/hour. Wait, or request a higher "
+                    "limit at https://www.pexels.com/api/",
+                    file=sys.stderr,
+                )
+        elif "429" in message or "403" in message or "Sign in to confirm" in message:
             print(
                 "hint: YouTube is throttling this client. Wait a minute, or pass "
                 "--cookies-from-browser chrome to authenticate.",

@@ -101,17 +101,47 @@ def query_for(segment: Segment, *, model: str | None = None) -> dict:
     return {"query": query, "keywords": [word for word in keywords if word][:8]}
 
 
-def lexical_score(want: set[str], clip: Clip) -> float:
-    """Overlap between the wanted visuals and what a clip is known to show.
+_BROADEN_SCHEMA = {
+    "type": "object",
+    "properties": {"terms": {"type": "array", "items": {"type": "string"}}},
+    "required": ["terms"],
+}
 
-    The clip's own description is weighted above its narration: the description
-    is about the picture, the narration only correlates with it.
+
+def broaden(query: str, *, model: str | None = None) -> list[str]:
+    """Ask for wider terms when a query matches nothing in the library.
+
+    Full-text search cannot connect "black panther" to a clip described as
+    "leopard resting in natural habitat" - the words simply do not overlap, even
+    though the footage is right. One cheap model call bridges that gap before we
+    give up and drop in filler.
     """
-    if not want:
-        return 0.0
-    described = tokens(clip.visual_description, " ".join(clip.keywords))
-    narrated = tokens(clip.text)
-    return (2.0 * len(want & described) + len(want & narrated)) / (2.0 * len(want))
+    prompt = (
+        f"A search for stock footage showing {query!r} returned nothing.\n"
+        "List 6 broader or closely related single subjects that footage of this "
+        "could plausibly be found under - more general categories, close relatives, "
+        "or the setting. For 'black panther' you might answer: leopard, jaguar, "
+        "big cat, wild cat, jungle, predator.\n"
+        "Respond as JSON."
+    )
+    try:
+        reply = generate_json(prompt, _BROADEN_SCHEMA, model=model)
+    except LLMError:
+        return []
+    return [str(term).strip().lower() for term in reply.get("terms") or [] if str(term).strip()][:8]
+
+
+def _normalize(scored: list[tuple[Clip, float]]) -> list[tuple[Clip, float]]:
+    """Rescale BM25 output to 0-1 within the candidate set.
+
+    BM25 is unbounded and corpus-relative, so a raw score means nothing on its
+    own. REUSE_PENALTY and CLEAR_MARGIN are tuned as fractions of "the best
+    match available for this segment", which only holds if the top hit is 1.0.
+    """
+    if not scored:
+        return []
+    best = max(score for _, score in scored) or 1.0
+    return [(clip, score / best) for clip, score in scored]
 
 
 def _rerank(query: str, candidates: list[tuple[Clip, float]], *, model: str | None) -> tuple[int, str]:
@@ -138,24 +168,58 @@ def _rerank(query: str, candidates: list[tuple[Clip, float]], *, model: str | No
 
 def choose(
     segments: list[Segment],
-    clips: list[Clip],
+    library,
     *,
     exclude_sources: set[str] = frozenset(),
     model: str | None = None,
-    allow_reuse: bool = True,
+    provider: str | None = None,
 ) -> list[Match]:
-    """Match every segment to a clip, in order."""
-    pool = [clip for clip in clips if clip.source_id not in exclude_sources]
+    """Match every segment to a clip, in order.
+
+    Shortlisting happens in SQLite (BM25 over the clip text), so this stays the
+    same speed whether the library holds two hundred clips or fifty thousand.
+    """
     matches: list[Match] = []
     used: set[str] = set()
 
     for segment in segments:
         wanted = query_for(segment, model=model)
-        want = tokens(wanted["query"], " ".join(wanted["keywords"]))
+        terms = list(tokens(wanted["query"], " ".join(wanted["keywords"])))
 
-        available = pool if allow_reuse else [clip for clip in pool if clip.clip_id not in used]
-        if not available:
-            matches.append(Match(segment, None, wanted["query"], 0.0, "no clip available"))
+        # Over-fetch so the reuse penalty has somewhere to demote a clip to.
+        found = library.search(
+            terms,
+            limit=SHORTLIST * 2,
+            exclude_sources=exclude_sources,
+            provider=provider,
+        )
+        if not found:
+            widened = broaden(wanted["query"], model=model)
+            if widened:
+                found = library.search(
+                    widened,
+                    limit=SHORTLIST * 2,
+                    exclude_sources=exclude_sources,
+                    provider=provider,
+                )
+
+        if not found:
+            # No text match anywhere. Fill the slot rather than leave a hole -
+            # an unmatched segment shortens the render and truncates the audio.
+            spare = [
+                clip
+                for clip in library.fallback_clips(
+                    exclude_sources=exclude_sources, provider=provider
+                )
+                if clip.clip_id not in used
+            ]
+            if not spare:
+                matches.append(Match(segment, None, wanted["query"], 0.0, "library is empty"))
+                continue
+            matches.append(
+                Match(segment, spare[0], wanted["query"], 0.0, "filler - nothing matched the query")
+            )
+            used.add(spare[0].clip_id)
             continue
 
         # Repeating a clip is a cost, not a prohibition. Excluding used clips
@@ -163,8 +227,8 @@ def choose(
         # leave a later "bears hibernate" segment matching a snake.
         scored = sorted(
             (
-                (clip, lexical_score(want, clip) - (REUSE_PENALTY if clip.clip_id in used else 0.0))
-                for clip in available
+                (clip, score - (REUSE_PENALTY if clip.clip_id in used else 0.0))
+                for clip, score in _normalize(found)
             ),
             key=lambda pair: (pair[1], pair[0].duration >= segment.duration),
             reverse=True,
@@ -173,7 +237,7 @@ def choose(
         if len(shortlist) == 1:
             index, reason = 0, "only candidate"
         elif shortlist[0][1] - shortlist[1][1] >= CLEAR_MARGIN:
-            index, reason = 0, f"clear lexical winner ({shortlist[0][1]:.2f})"
+            index, reason = 0, f"clear winner ({shortlist[0][1]:.2f})"
         else:
             index, reason = _rerank(wanted["query"], shortlist, model=model)
         clip, score = shortlist[index]

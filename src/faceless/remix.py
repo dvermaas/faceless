@@ -9,16 +9,22 @@ from pathlib import Path
 
 from yt_dlp.utils import DownloadError
 
+from . import pexels
 from .download import GrabError, grab
-from .library import Clip, Library, LibraryError, clips_from, segments_for
+from .library import Clip, Library, LibraryError, clips_from, import_clip, segments_for
 from .llm import warm
 from .match import Match, choose
+from .pexels import PexelsError
 from .render import render
 from .search import search
 from .segments import DEFAULT_MIN_DURATION, Segment
 from .ytdl import ClientOptions
 
 HARVEST_PAUSE = 3.0
+SOURCES = ("youtube", "pexels")
+# Segments run 2-4s and the renderer uses only the head of a clip, so keeping
+# more than this of a 30s stock video is storage for nothing.
+PEXELS_MAX_CLIP_SECONDS = 10.0
 
 
 @dataclass(slots=True)
@@ -52,19 +58,113 @@ def _subtitle_for(video: Path) -> Path | None:
 def harvest(
     query: str,
     *,
+    source: str = "youtube",
     limit: int = 5,
     library_root: Path | str = "library",
     downloads: Path | str = "downloads",
     min_duration: float = DEFAULT_MIN_DURATION,
     model: str | None = None,
+    pexels_key: str | None = None,
     client: ClientOptions | None = None,
     on_progress=None,
 ) -> HarvestResult:
-    """Find Shorts, download them, and file every scene as a reusable clip."""
+    """Grow the clip library from `query`, using the chosen source."""
+    if source not in SOURCES:
+        raise LibraryError(f"unknown source {source!r}; expected one of {', '.join(SOURCES)}")
     library = Library(library_root)
     result = HarvestResult()
-    warm(model)
+    if source == "pexels":
+        _harvest_pexels(
+            query,
+            library,
+            result,
+            limit=limit,
+            downloads=Path(downloads),
+            key=pexels_key,
+            on_progress=on_progress,
+        )
+        library.save()
+        return result
+    return _harvest_youtube(
+        query,
+        library,
+        result,
+        limit=limit,
+        downloads=downloads,
+        min_duration=min_duration,
+        model=model,
+        client=client,
+        on_progress=on_progress,
+    )
 
+
+def _harvest_pexels(
+    query: str,
+    library: Library,
+    result: HarvestResult,
+    *,
+    limit: int,
+    downloads: Path,
+    key: str | None,
+    on_progress=None,
+) -> None:
+    """File clean stock footage - no scene splitting, no model calls.
+
+    Pexels writes a descriptive slug into every video URL, so the description
+    that the YouTube path needs a model to infer is simply read off the URL.
+    """
+    videos = pexels.search(query, limit=limit, key=key)
+    if on_progress:
+        on_progress(f"pexels: {len(videos)} portrait clips for {query!r}")
+    staging = downloads / "pexels"
+    for video in videos:
+        source_id = f"pexels-{video.id}"
+        if library.has_source(source_id):
+            result.skipped.append(source_id)
+            continue
+        raw = staging / f"{source_id}.mp4"
+        try:
+            if on_progress:
+                on_progress(f"  fetch {video.description[:52]}")
+            pexels.download(video, raw)
+            clip = import_clip(
+                raw,
+                library,
+                clip_id_hint=query,
+                source_id=source_id,
+                source_url=video.url,
+                source_title=video.description,
+                author=video.author,
+                description=video.description,
+                keywords=video.keywords,
+                provider="pexels",
+                duration=video.duration,
+                max_seconds=PEXELS_MAX_CLIP_SECONDS,
+            )
+            result.added.append(clip)
+            library.save()
+        except (PexelsError, LibraryError, OSError) as exc:
+            result.failed.append((source_id, str(exc)[:200]))
+            if on_progress:
+                on_progress(f"  failed: {str(exc)[:120]}")
+        finally:
+            raw.unlink(missing_ok=True)
+
+
+def _harvest_youtube(
+    query: str,
+    library: Library,
+    result: HarvestResult,
+    *,
+    limit: int,
+    downloads: Path | str,
+    min_duration: float,
+    model: str | None,
+    client: ClientOptions | None,
+    on_progress=None,
+) -> HarvestResult:
+    """Find Shorts, download them, and file every scene as a reusable clip."""
+    warm(model)
     found = search(query, limit=limit, shorts=True, client=client)
     for position, item in enumerate(found):
         video_id = item["id"]
@@ -114,6 +214,22 @@ class RemixResult:
     matches: list[Match]
     output: Path | None = None
 
+    @property
+    def credits(self) -> list[dict]:
+        """Attribution for footage whose licence asks for it (Pexels does)."""
+        seen: dict[str, dict] = {}
+        for match in self.matches:
+            if match.clip and match.clip.provider == "pexels":
+                seen.setdefault(
+                    match.clip.source_id,
+                    {
+                        "author": match.clip.channel,
+                        "url": match.clip.source_url,
+                        "provider": "pexels",
+                    },
+                )
+        return list(seen.values())
+
     def to_dict(self) -> dict:
         return {
             "target_id": self.target_id,
@@ -121,6 +237,7 @@ class RemixResult:
             "segment_count": len(self.segments),
             "matched": sum(1 for match in self.matches if match.clip),
             "output": str(self.output) if self.output else None,
+            "credits": self.credits,
             "matches": [match.to_dict() for match in self.matches],
         }
 
@@ -134,6 +251,7 @@ def remix(
     min_duration: float = DEFAULT_MIN_DURATION,
     model: str | None = None,
     dry_run: bool = False,
+    source: str = "any",
     client: ClientOptions | None = None,
     on_progress=None,
 ) -> RemixResult:
@@ -142,6 +260,12 @@ def remix(
     if not library.clips:
         raise LibraryError(
             f"the library at {library.root} is empty - run `faceless harvest` first"
+        )
+
+    if source != "any" and not any(clip.provider == source for clip in library.clips):
+        raise LibraryError(
+            f"no {source} clips in {library.root} - "
+            f"harvest some with `faceless harvest <query> --source {source}`"
         )
     warm(model)
 
@@ -157,13 +281,14 @@ def remix(
         raise LibraryError("target has no scenes to rebuild")
 
     if on_progress:
-        on_progress(f"matching {len(segments)} segments against {len(library.clips)} clips")
+        on_progress(f"matching {len(segments)} segments against {library.count()} clips")
     # Never recut the video we are rebuilding.
     matches = choose(
         segments,
-        library.clips,
+        library,
         exclude_sources={meta.get("id") or ""},
         model=model,
+        provider=None if source == "any" else source,
     )
 
     result = RemixResult(
@@ -175,7 +300,23 @@ def remix(
     if dry_run:
         return result
 
-    output = Path(out_dir) / f"{result.target_id}.remix.mp4"
+    # Logged only for real renders. A dry run is exploration - counting it would
+    # inflate "most reused" every time someone iterates on match quality.
+    for match in matches:
+        if match.clip:
+            library.record_usage(
+                match.clip,
+                result.target_id,
+                match.segment.index,
+                match.query,
+                match.score,
+                match.reason,
+            )
+
+    # Keep source-filtered runs in their own file so an A/B against the
+    # unfiltered remix does not silently clobber it.
+    suffix = "" if source == "any" else f".{source}"
+    output = Path(out_dir) / f"{result.target_id}.remix{suffix}.mp4"
     if on_progress:
         on_progress("rendering")
     result.output = render(

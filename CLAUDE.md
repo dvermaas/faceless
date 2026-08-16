@@ -36,6 +36,13 @@ ffprobe -v error -show_entries format=duration -of csv=p=0 remixes/<id>.remix.mp
 ffmpeg -hide_banner -i <file> -af volumedetect -f null NUL 2>&1 | grep volume
 ```
 
+**Library checks:**
+
+```sh
+uv run faceless library          # counts, providers, reuse
+uv run faceless library --gaps   # what to harvest next
+```
+
 **Look at the video.** Numeric checks pass on output that is visually wrong.
 Extracting a frame per segment into a contact sheet (`ffmpeg ... -filter_complex
 tile=5x3`) and viewing it is what exposed both the scene-detection accuracy and
@@ -50,9 +57,12 @@ Not Python packages, and all three are load-bearing:
   for `harvest`/`remix`.
 - **A JavaScript runtime** (deno/node/bun) - drives `yt-dlp-ejs`. Without it
   YouTube media URLs return `403`.
-- **Ollama** serving on `:11434` with `gemma4:12b` - all descriptions, queries,
-  and match reranking. No API key, no cloud calls. Override with `--model` /
-  `FACELESS_OLLAMA_MODEL` / `FACELESS_OLLAMA_HOST`.
+- **Ollama** serving on `:11434` with `gemma4:12b` - descriptions, queries, and
+  match reranking. No API key, no cloud calls. Override with `--model` /
+  `FACELESS_OLLAMA_MODEL` / `FACELESS_OLLAMA_HOST`. Not needed for
+  `harvest --source pexels`.
+- **`PEXELS_API_KEY`** (env var or `--pexels-key`) - only for
+  `harvest --source pexels`. Never write it to a file in the repo.
 
 ## Architecture
 
@@ -70,12 +80,14 @@ find ──► grab ──► meta.json + .vtt + .mp4 ──► harvest ──�
 | `subtitles.py` | VTT/SRT parsing; two distinct outputs (see below) |
 | `scenes.py` | PySceneDetect wrapper; returns a contiguous shot list |
 | `segments.py` | Aligns scenes with captions; merges shots too short to carry a clip |
+| `db.py` | SQLite schema, FTS5 index, and query helpers |
 | `library.py` | Cuts, names, describes, and indexes clips |
+| `pexels.py` | Stock-footage source; API client and slug-derived descriptions |
 | `llm.py` | Ollama client; schema-constrained JSON only |
 | `match.py` | Lexical prefilter + LLM rerank |
 | `render.py` | ffmpeg fit/concat/mux |
 | `remix.py` | Orchestrates `harvest` and `remix` |
-| `cli.py` | argparse wiring for all four subcommands |
+| `cli.py` | argparse wiring for all five subcommands |
 
 ### Invariants the design leans on
 
@@ -84,6 +96,22 @@ covering `0 → duration`, and `segments.build` preserves that through merging.
 This is why a rebuilt video lands on the source duration and the original audio
 stays in sync with no drift correction. Breaking contiguity breaks sync.
 
+**Every segment must end up with a clip.** Because the shot list tiles the source
+exactly, an unmatched segment shortens the picture and ffmpeg's `-shortest` then
+silently truncates the narration - a render came out 34.7s against a 42.7s source
+before this was caught. `match.choose` falls back to a least-used clip rather
+than leaving a hole, and `render.render` refuses outright if any segment is still
+unmatched. Do not "simplify" either by skipping unmatched segments.
+
+**Search shortlists in SQLite, not in Python.** `Library.search` ranks with
+FTS5/BM25 over description (weight 3), keywords (2) and narration (1), so
+matching cost does not grow with the library. BM25 is unbounded and
+corpus-relative, so `match._normalize` rescales each result set to 0-1 - the
+`REUSE_PENALTY` and `CLEAR_MARGIN` constants are fractions of "best available for
+this segment" and are meaningless against raw BM25. Terms must go through
+`db.fts_query`, which strips punctuation and underscores; raw caption text passed
+to `MATCH` raises "fts5: syntax error".
+
 **`meta.json` is the interchange format.** It uses the same schema as
 `find --full` (`search.normalize_entry`), plus `scenes`/`scene_count`. Both
 `harvest` and `remix` read it back off disk rather than passing objects around,
@@ -91,7 +119,17 @@ which is what makes those commands resumable and independently runnable.
 
 **Library clips inherit their source's narration.** That text - not any image
 analysis - is what makes a clip findable later. A clip with no captions has
-nothing to match on, so videos without English subtitles are skipped at harvest.
+nothing to match on, so YouTube videos without English subtitles are skipped at
+harvest.
+
+**Two clip sources share one library and one index.** `harvest --source youtube`
+splits finished Shorts along their cuts and needs a model call per clip to infer
+a description; `harvest --source pexels` files whole single-shot stock clips and
+needs no model at all, because Pexels writes a human description into every
+video URL slug (its `tags` field comes back empty - do not reach for it).
+`Clip.provider` records which, defaults to `"youtube"` so pre-Pexels index files
+still load, and drives `remix --source`. Both paths normalize identically
+(1080x1920, 30fps, no audio) so `render.py` never needs to care.
 
 **`subtitles.py` has two output paths that must not be conflated.**
 `to_lines`/`to_text` round to whole seconds and are for human-readable
@@ -135,6 +173,16 @@ mid-string - invisible in one test, fatal across the hundreds a harvest makes.
 subsequent calls answer in ~1s. Both commands call `llm.warm()` up front so the
 wait happens once and visibly. Timeouts are sized for this.
 
+**`usages` is what makes the library inspectable.** Recorded on real renders only
+(a dry run is exploration - counting it would inflate "most reused"). Its payoff
+is `faceless library --gaps`: queries that fell through to filler are exactly the
+footage the library lacks, so the pipeline writes its own harvest plan.
+
+**Lexical search cannot bridge vocabulary gaps** - "black panther" shares no
+words with "leopard resting in natural habitat" even though the footage fits.
+`match.broaden` spends one model call on related subjects and re-searches before
+giving up. This is the one place the model is clearly better than the index.
+
 **The local model will overrule strong evidence if allowed to.** It once picked a
 generic farm clip over an exact hippopotamus match (lexical 0.143 vs 0.500),
 reasoning itself out of the obvious answer. `match.CLEAR_MARGIN` therefore only
@@ -142,12 +190,20 @@ lets it break ties. Similarly, reuse is a scoring penalty rather than a
 prohibition - a hard no-reuse rule let an early segment consume the only bear
 clip and left a later bear segment matching a snake.
 
+**Pexels blocks urllib's default User-Agent with a 403** even when the key is
+valid - `pexels.USER_AGENT` exists for that reason. Its documented `quality`
+field also comes back `null` in practice, so renditions are selected by
+dimensions.
+
 ## Known limitation
 
-Harvested clips are cut from *finished* Shorts, so most carry the source's
+YouTube-sourced clips are cut from *finished* Shorts, so most carry the source's
 burned-in captions - words that now contradict our narration. It is the most
-visible flaw in a rendered remix and is inherent to this footage source, not a
-bug. Unsolved; see README for the options.
+visible flaw in such a remix and is inherent to that footage source, not a bug.
+`remix --source pexels` avoids it entirely (verified: a side-by-side on the same
+target had captions on most YouTube shots and none on the Pexels ones). Removing
+text after the fact needs per-frame detection plus inpainting and is not
+implemented.
 
 ## Conventions
 
