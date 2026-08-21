@@ -108,7 +108,7 @@ find ──► grab ──► meta.json + .vtt + .mp4 ──► harvest ──�
 | `pexels.py` | Stock-footage source; API client and slug-derived descriptions |
 | `llm.py` | Ollama client; schema-constrained JSON only |
 | `match.py` | Lexical prefilter + LLM rerank |
-| `captions.py` | Word-by-word ASS captions; libass styling, font checks, width fitting |
+| `captions.py` | Word-by-word ASS captions; libass styling, palettes, font checks, width fitting |
 | `render.py` | ffmpeg fit/concat/mux, and the caption burn-in |
 | `remix.py` | Orchestrates `harvest`, `remix`, and `reset` |
 | `cli.py` | argparse wiring for all six subcommands |
@@ -278,6 +278,29 @@ directory.
 through (`-c:v copy`); with them it has to run x264 again. That is the entire
 cost difference between a captioned and an uncaptioned remix.
 
+**ASS writes colour in two incompatible syntaxes.** A style field is
+`&HAABBGGRR` (alpha first); an inline `\c` override is `&HBBGGRR&` (no alpha,
+trailing ampersand). Both take the channels *backwards*. `_bgr` does the byte
+swap once and `_ass_colour`/`_colour_tag` wrap it, because getting the two forms
+crossed produces a plausible-looking wrong colour rather than an error.
+
+**`--caption-colour` takes a palette name as well as a hex triple**, and
+`CaptionStyle.palette` is what tells the two apart. With a palette every word
+carries a `\c` override and the style's own colour is only a fallback; with a
+fixed colour there are no overrides at all, because a hundred identical inline
+tags where one style field would do makes the script unreadable. Defaults are
+Impact at 190, which is the size that was judged right on real footage - it is
+not an arbitrary round number, so do not "tidy" it to 200.
+
+**Palette colours are dealt as shuffled packs, not picked independently.**
+Independent choice puts the same colour on three of six consecutive words often
+enough to look broken; straight cycling reads as a marching rainbow. Shuffling
+a copy of the palette, dealing it out, then shuffling another gives even
+coverage in an arbitrary-looking order - the only repeat it can produce is
+across the seam between two packs, which `_colour_run` swaps out. The seed is
+fixed so a re-render is identical; a random one would make two runs of the same
+video incomparable.
+
 ## State of the project
 
 The pipeline works end to end and has been verified on real videos: a clean
@@ -291,6 +314,9 @@ the karaoke stamps, output still 42.37s with audio unchanged at -17.1 dB, and
 twelve frames sampled across the video each showing the word being spoken at
 that moment (the one apparent miss was sampled exactly on a word boundary). The
 15-character "counterattacked" scaled to 66% and stayed inside the margins.
+`--caption-colour rainbow` was verified the same way and additionally checked
+for legibility: all six colours hold up over both pale grass and dark hide,
+which is what the black outline is carrying.
 
 What is **not** done, roughly in the order it would pay off:
 

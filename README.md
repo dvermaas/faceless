@@ -307,6 +307,7 @@ time, each appearing on the frame where it is spoken.
 
 ```sh
 faceless remix "https://youtu.be/VIDEO_ID" --captions
+faceless remix "https://youtu.be/VIDEO_ID" --captions --caption-color rainbow
 faceless remix "https://youtu.be/VIDEO_ID" --captions \
     --caption-font "Arial Black" --caption-size 170 \
     --caption-color "#FFE600" --caption-position 0.42
@@ -316,12 +317,25 @@ faceless remix "https://youtu.be/VIDEO_ID" --captions \
 |---|---|---|
 | `--captions` | off | burn captions in; nothing below applies without it |
 | `--caption-font` | `Impact` | any installed font family |
-| `--caption-size` | `200` | cap height against a 1080×1920 frame |
-| `--caption-color` | `#FFFFFF` | fill colour (`--caption-colour` also works) |
+| `--caption-size` | `190` | cap height against a 1080×1920 frame |
+| `--caption-color` | `#FFFFFF` | `#RRGGBB`, or `rainbow` (`--caption-colour` also works) |
 | `--caption-outline` | `#000000` | outline and drop-shadow colour |
 | `--caption-position` | `0.30` | height above the bottom edge, as a fraction of the frame |
 | `--caption-mixed-case` | off | keep the transcript's capitalisation instead of upper-casing |
 | `--no-caption-pop` | off | draw each word flat instead of popping it in |
+
+`--caption-color rainbow` gives every word its own colour from a six-colour
+palette — red, orange, yellow, green, cyan, violet. The colours are dealt as
+shuffled packs rather than picked independently, so all six appear once per six
+words in an order that still looks arbitrary, and the same colour never lands
+twice in a row. Picking at random clumps badly enough to read as a bug; plain
+cycling reads as a marching rainbow. The shuffle is seeded, so re-rendering the
+same video gives the same colours and two runs stay comparable.
+
+The palette is deliberately short and saturated — each word is on screen for
+about a fifth of a second over moving footage. Indigo and true blue are left out
+because both go muddy against dark footage even with the outline. The outline
+stays a single colour, which is what keeps the bright fills readable.
 
 The timing comes from YouTube's own per-word stamps — auto-captions carry a
 `<00:00:00.560>` before every word — so a word appears when it is said rather

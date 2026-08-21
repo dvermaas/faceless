@@ -10,7 +10,14 @@ from pathlib import Path
 from yt_dlp.utils import DownloadError
 
 from . import __version__
-from .captions import DEFAULT_FONT, DEFAULT_POSITION, DEFAULT_SIZE, CaptionError, CaptionStyle
+from .captions import (
+    DEFAULT_FONT,
+    DEFAULT_POSITION,
+    DEFAULT_SIZE,
+    PALETTES,
+    CaptionError,
+    CaptionStyle,
+)
 from .download import DEFAULT_LANGS, DEFAULT_TEMPLATE, GrabError, grab
 from .library import Library, LibraryError
 from .llm import DEFAULT_MODEL, LLMError
@@ -554,8 +561,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--caption-colour",
         "--caption-color",
         default="#FFFFFF",
-        metavar="#RRGGBB",
-        help="fill colour of the words (default: #FFFFFF)",
+        metavar="COLOUR",
+        help=(
+            "fill colour of the words as #RRGGBB (default: #FFFFFF), or "
+            f"{' / '.join(sorted(PALETTES))} to give each word its own colour"
+        ),
     )
     captions_group.add_argument(
         "--caption-outline",

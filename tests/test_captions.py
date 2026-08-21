@@ -36,6 +36,17 @@ def test_a_colour_that_is_not_a_hex_triple_is_refused(bad):
         captions._ass_colour(bad)
 
 
+def test_the_colour_error_names_the_palettes_as_well():
+    """`--caption-colour rainbo` should not read as "hex triples only"."""
+    with pytest.raises(CaptionError, match="rainbow"):
+        captions._ass_colour("rainbo")
+
+
+def test_an_inline_colour_override_drops_the_alpha_and_closes_with_an_ampersand():
+    """`\\c` takes &HBBGGRR&; a style field's &HAABBGGRR is not the same syntax."""
+    assert captions._colour_tag("#FF3B30") == "\\c&H303BFF&"
+
+
 def test_times_are_centiseconds():
     """ASS has no millisecond field; rendering one produces an unplayable line."""
     assert captions._ass_time(0.0) == "0:00:00.00"
@@ -100,6 +111,70 @@ def test_the_pop_can_be_turned_off():
     plain = build_ass([Word(0.0, 0.5, "x")], CaptionStyle(pop=False), 1080, 1920)
     assert "\\t(" not in plain
     assert "\\t(" in build_ass([Word(0.0, 0.5, "x")], CaptionStyle(), 1080, 1920)
+
+
+# -- palettes ------------------------------------------------------------
+
+
+def test_a_palette_name_is_accepted_where_a_colour_goes():
+    assert CaptionStyle(colour="rainbow").palette == captions.PALETTES["rainbow"]
+    assert CaptionStyle(colour="RainBow").palette == captions.PALETTES["rainbow"]
+
+
+def test_a_fixed_colour_has_no_palette():
+    assert CaptionStyle(colour="#FFE600").palette is None
+
+
+def test_the_outline_cannot_be_a_palette():
+    """Every word is outlined in one colour; a rainbow outline is not a thing."""
+    with pytest.raises(CaptionError, match="RRGGBB"):
+        CaptionStyle(outline_colour="rainbow")
+
+
+def test_every_word_gets_its_own_colour_override():
+    words = [Word(i * 0.5, (i + 1) * 0.5, "x") for i in range(6)]
+    events = _events(build_ass(words, CaptionStyle(colour="rainbow"), 1080, 1920))
+    tints = {event.split("\\c")[1].split("&")[1] for event in events}
+    assert len(events) == 6
+    assert len(tints) == 6  # one bag of the palette, all six used
+
+
+def test_a_fixed_colour_sets_the_style_and_overrides_nothing():
+    """Six identical inline overrides where one style field would do is noise."""
+    words = [Word(i * 0.5, (i + 1) * 0.5, "x") for i in range(3)]
+    script = build_ass(words, CaptionStyle(colour="#FFE600"), 1080, 1920)
+    assert "\\c&H" not in script
+    assert "&H0000E6FF" in script  # on the Style line instead
+
+
+def test_a_colour_is_never_used_twice_in_a_row():
+    """Two identical words back to back read as one word that failed to change."""
+    run = captions._colour_run(captions.PALETTES["rainbow"], 60)
+    assert all(this != following for this, following in zip(run, run[1:]))
+
+
+def test_the_palette_is_spread_evenly_rather_than_drawn_at_random():
+    """Independent picks clump: the same colour three times in six words."""
+    palette = captions.PALETTES["rainbow"]
+    run = captions._colour_run(palette, len(palette) * 5)
+    assert {run.count(colour) for colour in palette} == {5}
+
+
+def test_the_same_flags_produce_the_same_colours():
+    """A re-render has to be comparable to the one before it."""
+    palette = captions.PALETTES["rainbow"]
+    assert captions._colour_run(palette, 40) == captions._colour_run(palette, 40)
+
+
+def test_a_run_shorter_than_the_palette_is_not_padded():
+    assert len(captions._colour_run(captions.PALETTES["rainbow"], 2)) == 2
+
+
+def test_every_palette_colour_is_a_usable_hex_triple():
+    for name, palette in captions.PALETTES.items():
+        assert palette, f"{name} is empty"
+        for colour in palette:
+            captions._ass_colour(colour)
 
 
 # -- fitting -------------------------------------------------------------

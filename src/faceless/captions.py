@@ -12,6 +12,7 @@ and pop animation below are one style line in ASS and a fight in drawtext.
 
 from __future__ import annotations
 
+import random
 import re
 import shutil
 import subprocess
@@ -24,12 +25,34 @@ from .subtitles import Word
 # Impact is on every Windows install and is the meme-caption default. Arial
 # Black and Segoe UI Black are the other two safe heavy faces here.
 DEFAULT_FONT = "Impact"
-# 200 fills roughly four fifths of a 1080-wide frame with an average word, which
+# 190 fills roughly four fifths of a 1080-wide frame with an average word, which
 # is the weight this style wants. 250 already crowds the margins.
-DEFAULT_SIZE = 200
+DEFAULT_SIZE = 190
 # Fraction of frame height between the bottom edge and the middle of the word.
 DEFAULT_POSITION = 0.30
 _HEX = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+# Named alternatives to a single fixed colour: each word takes the next colour
+# from the palette. Kept short and saturated on purpose - these are read for a
+# fifth of a second each over moving footage, so the colours have to be
+# distinguishable at a glance and survive being wrapped in a black outline.
+# Indigo and true blue are the notable omissions: both go muddy against dark
+# footage even outlined, which is why this is a rainbow of six and not seven.
+PALETTES: dict[str, tuple[str, ...]] = {
+    "rainbow": (
+        "#FF3B30",  # red
+        "#FF9F0A",  # orange
+        "#FFD60A",  # yellow
+        "#32D74B",  # green
+        "#40C8FF",  # cyan
+        "#BF5AF2",  # violet
+    ),
+}
+# The palette order is shuffled rather than cycled, so the colours do not march
+# predictably through the rainbow, but the shuffle is seeded: the same video
+# re-rendered has to come out identical, or comparing two runs means nothing.
+_PALETTE_SEED = 8624
+
 # Outline and shadow are fractions of the font size, so changing --caption-size
 # keeps the proportions instead of thinning the text out.
 _OUTLINE_RATIO = 0.075
@@ -58,13 +81,50 @@ class CaptionError(RuntimeError):
     """Raised when captions cannot be built or burned in."""
 
 
-def _ass_colour(value: str) -> str:
-    """`#RRGGBB` -> `&H00BBGGRR`. ASS stores colour backwards, with alpha first."""
+def _bgr(value: str) -> str:
+    """`#RRGGBB` -> `BBGGRR`. ASS stores colour channels backwards."""
     match = _HEX.match(value.strip())
     if not match:
-        raise CaptionError(f"colour must be #RRGGBB, not {value!r}")
+        raise CaptionError(
+            f"colour must be #RRGGBB or one of {', '.join(sorted(PALETTES))}, not {value!r}"
+        )
     red, green, blue = (match.group(1)[index : index + 2] for index in (0, 2, 4))
-    return f"&H00{blue}{green}{red}".upper()
+    return f"{blue}{green}{red}".upper()
+
+
+def _ass_colour(value: str) -> str:
+    """The colour as a style field: `&HAABBGGRR`, alpha first."""
+    return f"&H00{_bgr(value)}"
+
+
+def _colour_tag(value: str) -> str:
+    """The colour as an inline override: `\\c&HBBGGRR&`, no alpha, trailing `&`."""
+    return f"\\c&H{_bgr(value)}&"
+
+
+def _colour_run(palette: tuple[str, ...], count: int) -> list[str]:
+    """`count` colours from `palette`: shuffled, even, and never twice in a row.
+
+    Drawn as shuffled bags rather than independent picks. Picking each word's
+    colour at random clumps - the same colour lands three times in six words and
+    reads as a bug - while plain cycling reads as a marching rainbow. Dealing a
+    shuffled copy of the whole palette, then another, gives every colour exactly
+    one appearance per six words in an order that still looks arbitrary.
+
+    Seeded, because a video re-rendered with the same flags has to come out
+    identical or comparing two runs means nothing.
+    """
+    rng = random.Random(_PALETTE_SEED)
+    run: list[str] = []
+    while len(run) < count:
+        bag = list(palette)
+        rng.shuffle(bag)
+        # One bag can end on the colour the next one starts with; that is the
+        # only place a repeat can survive the shuffle, so undo it here.
+        if run and len(bag) > 1 and bag[0] == run[-1]:
+            bag[0], bag[1] = bag[1], bag[0]
+        run.extend(bag)
+    return run[:count]
 
 
 def _ass_time(seconds: float) -> str:
@@ -92,6 +152,7 @@ class CaptionStyle:
 
     font: str = DEFAULT_FONT
     size: int = DEFAULT_SIZE
+    # A `#RRGGBB` triple, or a name from PALETTES to colour each word in turn.
     colour: str = "#FFFFFF"
     outline_colour: str = "#000000"
     position: float = DEFAULT_POSITION
@@ -106,8 +167,15 @@ class CaptionStyle:
                 f"caption position is a fraction of frame height, so 0.0-1.0, not {self.position}"
             )
         # Fail here rather than let libass quietly render a default-coloured video.
-        _ass_colour(self.colour)
-        _ass_colour(self.outline_colour)
+        if self.palette is None:
+            _bgr(self.colour)
+        # An outline is always one colour; a rainbow outline is not a thing.
+        _bgr(self.outline_colour)
+
+    @property
+    def palette(self) -> tuple[str, ...] | None:
+        """The colours to spread across the words, or None for one fixed colour."""
+        return PALETTES.get(self.colour.strip().lower())
 
     @property
     def outline(self) -> float:
@@ -243,8 +311,13 @@ def build_ass(
     if not words:
         raise CaptionError("no words to caption - the video has no usable captions")
 
+    palette = style.palette
+    # With a palette the style's own colour is only a fallback - every event
+    # overrides it - but it still has to be a real colour, so the first one
+    # stands in rather than something arbitrary.
+    primary = palette[0] if palette else style.colour
     head = [
-        line.replace("{primary}", _ass_colour(style.colour)).replace(
+        line.replace("{primary}", _ass_colour(primary)).replace(
             "{outline_colour}", _ass_colour(style.outline_colour)
         )
         for line in _header(style.font, style.size, width, height, style.outline, style.shadow)
@@ -255,9 +328,10 @@ def build_ass(
     centre_x, centre_y = width // 2, round(height * (1.0 - style.position))
     usable = width - 2 * round(width * _MARGIN_RATIO)
     measured = measured or {}
+    colours = _colour_run(palette, len(words)) if palette else None
 
     events = []
-    for word in words:
+    for position, word in enumerate(words):
         text = _escape(word.text.upper() if style.uppercase else word.text)
         scale = _fit(text, style, measured, usable)
         if style.pop:
@@ -265,9 +339,10 @@ def build_ass(
             sizing = f"\\fscx{grown}\\fscy{grown}\\t(0,{_POP_MS},\\fscx{scale}\\fscy{scale})"
         else:
             sizing = "" if scale == 100 else f"\\fscx{scale}\\fscy{scale}"
+        tint = _colour_tag(colours[position]) if colours else ""
         events.append(
             f"Dialogue: 0,{_ass_time(word.start)},{_ass_time(word.end)},Word,,0,0,0,,"
-            f"{{\\an5\\pos({centre_x},{centre_y}){sizing}}}{text}"
+            f"{{\\an5\\pos({centre_x},{centre_y}){tint}{sizing}}}{text}"
         )
     return "\n".join(head + events) + "\n"
 
