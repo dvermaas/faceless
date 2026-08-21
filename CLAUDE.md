@@ -45,7 +45,19 @@ ffprobe -v error -show_entries format=duration -of csv=p=0 remixes/<id>.remix.mp
 
 # audio must be untouched - compare against the source
 ffmpeg -hide_banner -i <file> -af volumedetect -f null NUL 2>&1 | grep volume
+
+# caption sync: what parse_words says should be on screen at time T ...
+python -c "import sys; sys.path.insert(0,'src'); from faceless.subtitles import parse_words; \
+print([w.text for w in parse_words(open('downloads/<id>.en.vtt',encoding='utf-8').read()) \
+if w.start <= 21.0 < w.end])"
+# ... has to be the word in the frame at T. Sampling an already-burned file is
+# just a seek; sample several times across the whole video, not only the opening.
+ffmpeg -v error -ss 21.0 -i remixes/<id>.remix.mp4 -frames:v 1 -y f.jpg
 ```
+
+If you preview a style by applying `subtitles=` as a *filter* instead, put `-ss`
+**after** `-i`. Input seeking restarts the filter's clock, so every frame draws
+the first word - it looks like total desync and is an artefact of the check.
 
 **Library checks:**
 
@@ -88,7 +100,7 @@ find ──► grab ──► meta.json + .vtt + .mp4 ──► harvest ──�
 |---|---|
 | `search.py` | YouTube discovery; Shorts filtering and detection |
 | `download.py` | yt-dlp orchestration; writes the `.meta.json` sidecar |
-| `subtitles.py` | VTT/SRT parsing; two distinct outputs (see below) |
+| `subtitles.py` | VTT/SRT parsing; three distinct outputs (see below) |
 | `scenes.py` | PySceneDetect wrapper; returns a contiguous shot list |
 | `segments.py` | Aligns scenes with captions; merges shots too short to carry a clip |
 | `db.py` | SQLite schema, FTS5 index, and query helpers |
@@ -96,7 +108,8 @@ find ──► grab ──► meta.json + .vtt + .mp4 ──► harvest ──�
 | `pexels.py` | Stock-footage source; API client and slug-derived descriptions |
 | `llm.py` | Ollama client; schema-constrained JSON only |
 | `match.py` | Lexical prefilter + LLM rerank |
-| `render.py` | ffmpeg fit/concat/mux |
+| `captions.py` | Word-by-word ASS captions; libass styling, font checks, width fitting |
+| `render.py` | ffmpeg fit/concat/mux, and the caption burn-in |
 | `remix.py` | Orchestrates `harvest`, `remix`, and `reset` |
 | `cli.py` | argparse wiring for all six subcommands |
 
@@ -105,7 +118,9 @@ in `tests/`, one module per source module plus `test_harness.py` (which verifies
 the no-network guard) and `test_integration.py` (opt-in, real services).
 
 Outputs are `remixes/<id>.remix.mp4`, or `<id>.remix.<source>.mp4` when
-`--source` is set, so a filtered run never clobbers an unfiltered one.
+`--source` is set, so a filtered run never clobbers an unfiltered one. With
+`--captions`, the ASS script is kept beside the video as `<same stem>.ass` -
+it is the one output worth hand-editing and burning in again.
 
 ### Invariants the design leans on
 
@@ -149,12 +164,26 @@ video URL slug (its `tags` field comes back empty - do not reach for it).
 still load, and drives `remix --source`. Both paths normalize identically
 (1080x1920, 30fps, no audio) so `render.py` never needs to care.
 
-**`subtitles.py` has two output paths that must not be conflated.**
+**`subtitles.py` has three output paths that must not be conflated.**
 `to_lines`/`to_text` round to whole seconds and are for human-readable
 transcripts; `parse_timed_cues` keeps float bounds and is for aligning captions
-to shots. Both dedupe YouTube's rolling auto-captions, which repeat each line
-across consecutive cues (~9x size reduction). Changing one must not change the
-other.
+to shots; `parse_words` reads YouTube's inline `<00:00:00.560><c>` karaoke
+stamps and is for burned-in captions. All three dedupe the rolling
+auto-captions, which repeat each line across consecutive cues (~9x size
+reduction). Changing one must not change the others.
+
+The first two share `_parse_blocks`, which carries the one-cue-late defect
+below. `parse_words` deliberately uses `_parse_blocks_raw` instead, which ends a
+cue only on a genuinely empty line, per the WebVTT spec. Both call the same
+`_scan` with different `ends_cue` predicates, so the disagreement is visible in
+one place rather than duplicated. **A word's time comes from its own stamp, not
+from the cue carrying it**, so captions land on the right frame even while the
+transcript of the same file is two seconds behind.
+
+**Word timings map onto output time unchanged.** Because segments tile the
+source exactly, output time and source time are the same clock - the ASS is
+timed against the source and burned onto the rebuild with no offset. If scene
+contiguity is ever broken, captions drift along with the audio.
 
 ## Non-obvious constraints, learned the hard way
 
@@ -213,6 +242,42 @@ valid - `pexels.USER_AGENT` exists for that reason. Its documented `quality`
 field also comes back `null` in practice, so renditions are selected by
 dimensions.
 
+**libass never fails on a missing font.** It substitutes another face and says
+nothing, so a typo in `--caption-font` produces a finished, wrong-looking video
+with no error anywhere. `captions.probe_font` renders one 64x64 frame first and
+reads libass's info-level `fontselect: (asked) -> (got)` line; `remix` refuses
+before encoding rather than after. This build resolves fonts through
+**directwrite, not fontconfig**, so that line reports a family name, not a file
+path - there is no font file to read metrics from.
+
+**libass will not break inside a word.** A word wider than the frame does not
+wrap; it runs off both edges, which is the worst thing this feature can do. So
+`captions.measure_widths` measures every distinct word for real - one ffmpeg
+pass drawing each on its own frame of a 4000px canvas, with `cropdetect`
+reporting the bounding boxes - and `_fit` scales the over-wide ones down
+individually. Estimating from character count cannot work across fonts: Arial
+Black renders "COUNTERATTACKED" 32% wider than Impact at the same size. The
+measurement degrades to "no scaling" if anything goes wrong, so it costs
+fitting, never the render.
+
+**`cropdetect`'s `limit` must be given as an integer here.** The documented 0-1
+fractional form parses differently in this build: `limit=0.06` matches the whole
+frame and `limit=64` matches nothing at all, while `limit=24` (its own
+documented default) is correct. A frame it found nothing in reports a *negative*
+width, which would otherwise be read as a measurement.
+
+**Absolute paths inside an ffmpeg filtergraph are a Windows escaping trap** -
+`subtitles=C:/path/x.ass` needs the drive colon escaped, and getting it wrong
+fails as an unparseable option minute-deep into an encode. `render` sidesteps it
+by copying the ASS into its temp dir and running ffmpeg with `cwd` set there, so
+the filter sees the bare name `captions.ass`. That is also why the mux resolves
+its input and output paths first: relative ones would otherwise land in the temp
+directory.
+
+**Burning captions forces a re-encode.** Without them the mux copies the picture
+through (`-c:v copy`); with them it has to run x264 again. That is the entire
+cost difference between a captioned and an uncaptioned remix.
+
 ## State of the project
 
 The pipeline works end to end and has been verified on real videos: a clean
@@ -221,17 +286,27 @@ produced `remixes/W_mE_LdGA9g.remix.pexels.mp4` at 42.37s against a 42.39s
 source, audio bit-for-bit unchanged (mean -17.1 dB in both), all seven segments
 matched, and no burned-in captions in any frame.
 
+`remix --captions` has been verified on the same target: 129 words parsed from
+the karaoke stamps, output still 42.37s with audio unchanged at -17.1 dB, and
+twelve frames sampled across the video each showing the word being spoken at
+that moment (the one apparent miss was sampled exactly on a word boundary). The
+15-character "counterattacked" scaled to 66% and stayed inside the margins.
+
 What is **not** done, roughly in the order it would pay off:
 
 1. **Captions land about one cue late** - see the open defect below. Most likely
-   cause of narration not lining up with the picture.
+   cause of narration not lining up with the picture. Note this affects
+   *matching* only: burned-in captions read the karaoke stamps and are unaffected.
 2. **Scene detection misses some cuts** on softer transitions. `--scene-threshold`
    below 27 is the lever; nobody has swept it.
 3. **Stock footage is tonally wrong for dramatic narration.** Pexels skews calm:
    a script about a lion being thrown by buffalo gets lions dozing. The subject
    matches, the action never does. No fix attempted.
-4. **No burned-in captions on output.** Deliberately out of scope for v1; these
-   Shorts normally have them.
+4. **Captions can only be re-burned by re-running the whole remix.** The ASS is
+   kept next to the video and can be edited by hand, but nothing will burn it in
+   again without redoing the download, the match and the render. A `faceless
+   caption <video> <ass>` subcommand would make iterating on font and size cheap;
+   `render._run` already does the work.
 5. **Harvest is manual.** `library --gaps` prints exactly what to harvest next,
    but nothing feeds that back into `harvest` automatically.
 
@@ -245,10 +320,11 @@ seconds later than they were spoken. Nothing is lost (rolling captions repeat
 each line) but every caption is late, which drags narration one shot behind the
 picture and therefore degrades matching. `tests/test_subtitles.py::
 test_whitespace_only_line_ends_the_cue_text` pins the current behaviour so the
-fix is a deliberate act. The fix is one line - break only on a genuinely empty
-line, per the WebVTT spec, where a line containing a space is *not* empty - but
-it shifts every transcript timing and changes remix output, so re-verify the
-end-to-end run after changing it.
+fix is a deliberate act. The fix is one line - have `_parse_blocks` pass
+`_parse_blocks_raw`'s predicate to `_scan`, which already implements the WebVTT
+rule that a line containing a space is *not* empty - but it shifts every
+transcript timing and changes remix output, so re-verify the end-to-end run
+after changing it. Burned-in captions do not depend on this and will not move.
 
 **YouTube-sourced clips carry burned-in captions.** They are cut from *finished*
 Shorts, so most arrive with the source's own words on screen, contradicting our
@@ -256,7 +332,15 @@ narration. It is the most visible flaw in such a remix and is inherent to that
 footage source, not a bug. `remix --source pexels` avoids it entirely (verified:
 a side-by-side on the same target had captions on most YouTube shots and none on
 the Pexels ones). Removing text after the fact needs per-frame detection plus
-inpainting and is not implemented.
+inpainting and is not implemented. Note this is the *source's* text in the
+footage, and is unrelated to `--captions`, which draws our own narration on top
+- combining the two on YouTube-sourced footage stacks two sets of words.
+
+**A word with no karaoke stamp is only evenly spaced.** Manual subtitle tracks
+and SRT carry no per-word timing at all, so `parse_words` spreads each cue's
+words across the cue. The captions stay in sync at cue granularity but individual
+words drift within it. YouTube's auto-captions - the normal case - are stamped
+per word and unaffected.
 
 ## Conventions
 

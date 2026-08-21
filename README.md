@@ -3,7 +3,7 @@
 An AI-in-the-loop pipeline for producing YouTube Shorts. It finds Shorts, pulls
 down their media and transcripts, detects every cut, files each shot as a
 reusable clip, and rebuilds a target Short from that library over its original
-audio.
+audio, optionally with word-by-word captions burned over the top.
 
 ```
 find ──► grab ──► harvest ──► remix
@@ -49,7 +49,7 @@ Output lands in `downloads/` (sources), `library/` (clips), and `remixes/`
 ## Tests
 
 ```sh
-uv run pytest                  # ~100 unit tests, about a second, no network
+uv run pytest                  # ~140 unit tests, about a second, no network
 uv run pytest -m integration   # opt-in: checks ffmpeg, Ollama, Pexels and YouTube
 ```
 
@@ -272,6 +272,7 @@ library clip matched to what is being said at that moment.
 ```sh
 faceless remix "https://youtu.be/VIDEO_ID" --dry-run          # print the plan, render nothing
 faceless remix "https://youtu.be/VIDEO_ID" --source pexels    # clean footage only
+faceless remix "https://youtu.be/VIDEO_ID" --captions         # with word-by-word captions
 faceless remix "https://youtu.be/VIDEO_ID" -o remixes
 ```
 
@@ -299,6 +300,48 @@ Clips from the video being rebuilt are never reused. Start with `--dry-run`: it
 prints each segment, the query derived from its narration, the chosen clip and
 why, and renders nothing — it is the cheap loop for judging match quality.
 
+### Word-by-word captions
+
+`--captions` burns the target's own narration into the output one word at a
+time, each appearing on the frame where it is spoken.
+
+```sh
+faceless remix "https://youtu.be/VIDEO_ID" --captions
+faceless remix "https://youtu.be/VIDEO_ID" --captions \
+    --caption-font "Arial Black" --caption-size 170 \
+    --caption-color "#FFE600" --caption-position 0.42
+```
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--captions` | off | burn captions in; nothing below applies without it |
+| `--caption-font` | `Impact` | any installed font family |
+| `--caption-size` | `200` | cap height against a 1080×1920 frame |
+| `--caption-color` | `#FFFFFF` | fill colour (`--caption-colour` also works) |
+| `--caption-outline` | `#000000` | outline and drop-shadow colour |
+| `--caption-position` | `0.30` | height above the bottom edge, as a fraction of the frame |
+| `--caption-mixed-case` | off | keep the transcript's capitalisation instead of upper-casing |
+| `--no-caption-pop` | off | draw each word flat instead of popping it in |
+
+The timing comes from YouTube's own per-word stamps — auto-captions carry a
+`<00:00:00.560>` before every word — so a word appears when it is said rather
+than when its subtitle cue starts. Sound effects like `[music]` are dropped, a
+word never overlaps the next, and one left hanging by a pause in the speech
+clears after a second instead of sitting there.
+
+Words too wide for the frame are scaled down individually. libass will not break
+inside a word, so without this a long one runs off both edges; every distinct
+word is measured in the real font first, and only the offenders shrink.
+
+`Impact`, `Arial Black` and `Segoe UI Black` are the safe heavy faces on
+Windows. A font that is not installed is refused up front — libass would
+otherwise substitute another silently and hand you a finished video in the wrong
+typeface.
+
+The ASS script is written next to the video (`<id>.remix.pexels.ass`), so you
+can read exactly what was drawn and when, or edit it by hand. Re-burning an
+edited one currently means re-running the remix.
+
 ### `faceless reset`
 
 Deletes the clip library, the downloads and the rendered remixes, to start clean.
@@ -315,7 +358,10 @@ nothing. If a path cannot be removed it says which and exits non-zero rather
 than reporting a success it did not achieve. A database viewer attached to
 `library/library.db` will block that deletion on Windows; close it and re-run.
 
-### Burned-in captions, and what to do about them
+### Captions the *footage* came with, and what to do about them
+
+Not to be confused with `--captions` above, which draws our own narration. This
+is text baked into the borrowed clips before we ever saw them.
 
 Clips harvested from YouTube are cut from *finished* Shorts, so they inherit
 whatever those creators burned into the picture. A reused clip arrives with a
@@ -327,6 +373,8 @@ cutting.
 **`--source pexels` avoids it entirely.** Stock footage carries no on-screen
 text, so the pictures stay clean. Side by side on the same target video, the
 YouTube remix had a caption stamped across most shots; the Pexels remix had none.
+It also pairs best with `--captions`: on YouTube-sourced footage the two sets of
+words stack on top of each other.
 
 Removing text from footage that already has it is the harder road — it needs
 per-frame text detection plus video inpainting, is slow, and leaves smears on
@@ -343,6 +391,10 @@ VTT parser treats YouTube's whitespace-only separator line as the end of a cue.
 Nothing is lost, but everything is late, which is the most likely reason a shot
 sometimes matches the *previous* sentence. See CLAUDE.md → Known limitations for
 the one-line fix and why it has not been applied yet.
+
+This affects **matching** only. Burned-in captions read the per-word stamps
+directly rather than the cue boundaries, so they are unaffected and stay on the
+frame where the word is spoken.
 
 ### Local model
 

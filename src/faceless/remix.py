@@ -11,14 +11,25 @@ from pathlib import Path
 from yt_dlp.utils import DownloadError
 
 from . import pexels
+from .captions import CaptionError, CaptionStyle, probe_font, write_ass
 from .download import GrabError, grab
-from .library import Clip, Library, LibraryError, clips_from, import_clip, segments_for
+from .library import (
+    TARGET_HEIGHT,
+    TARGET_WIDTH,
+    Clip,
+    Library,
+    LibraryError,
+    clips_from,
+    import_clip,
+    segments_for,
+)
 from .llm import warm
 from .match import Match, choose
 from .pexels import PexelsError
 from .render import render
 from .search import search
 from .segments import DEFAULT_MIN_DURATION, Segment
+from .subtitles import parse_words
 from .ytdl import ClientOptions
 
 HARVEST_PAUSE = 3.0
@@ -262,6 +273,44 @@ def _harvest_youtube(
     return result
 
 
+def _check_font(style: CaptionStyle) -> None:
+    """Refuse an uninstalled font before anything expensive happens.
+
+    libass substitutes silently, so left unchecked this surfaces as a finished
+    video in the wrong typeface - looking for all the world like the style flags
+    were ignored. Checked here rather than at the point of use because by then
+    the download and the matching have already been paid for.
+    """
+    if not probe_font(style.font):
+        raise CaptionError(
+            f"no font named {style.font!r} is installed - libass would silently "
+            "substitute another. Try Impact, Arial Black or Segoe UI Black."
+        )
+
+
+def _write_captions(
+    subtitle: Path | None, target: Path, style: CaptionStyle, on_progress=None
+) -> Path:
+    """Turn the target's own captions into the ASS script rendered over it.
+
+    The words are timed against the source video, and the rebuild keeps source
+    timing exactly (segments tile it), so they land on the right frame without
+    any offset.
+    """
+    if subtitle is None:
+        raise CaptionError(
+            "captions were asked for but the target has no subtitle track - "
+            "re-grab it, or drop --captions"
+        )
+    words = parse_words(subtitle.read_text(encoding="utf-8", errors="replace"))
+    if not words:
+        raise CaptionError(f"no words could be read from {subtitle.name}")
+
+    if on_progress:
+        on_progress(f"captioning {len(words)} words in {style.font} {style.size}")
+    return write_ass(words, style, target, TARGET_WIDTH, TARGET_HEIGHT)
+
+
 @dataclass(slots=True)
 class RemixResult:
     target_id: str
@@ -269,6 +318,7 @@ class RemixResult:
     segments: list[Segment]
     matches: list[Match]
     output: Path | None = None
+    captions: Path | None = None
 
     @property
     def credits(self) -> list[dict]:
@@ -293,6 +343,7 @@ class RemixResult:
             "segment_count": len(self.segments),
             "matched": sum(1 for match in self.matches if match.clip),
             "output": str(self.output) if self.output else None,
+            "captions": str(self.captions) if self.captions else None,
             "credits": self.credits,
             "matches": [match.to_dict() for match in self.matches],
         }
@@ -308,6 +359,7 @@ def remix(
     model: str | None = None,
     dry_run: bool = False,
     source: str = "any",
+    captions: CaptionStyle | None = None,
     client: ClientOptions | None = None,
     on_progress=None,
 ) -> RemixResult:
@@ -323,6 +375,8 @@ def remix(
             f"no {source} clips in {library.root} - "
             f"harvest some with `faceless harvest <query> --source {source}`"
         )
+    if captions is not None:
+        _check_font(captions)
     warm(model)
 
     if on_progress:
@@ -332,7 +386,8 @@ def remix(
         raise LibraryError("no video file was saved for the target")
 
     meta = _meta_for(grabbed.video_path)
-    segments = segments_for(meta, _subtitle_for(grabbed.video_path), min_duration)
+    subtitle = _subtitle_for(grabbed.video_path)
+    segments = segments_for(meta, subtitle, min_duration)
     if not segments:
         raise LibraryError("target has no scenes to rebuild")
 
@@ -373,9 +428,19 @@ def remix(
     # unfiltered remix does not silently clobber it.
     suffix = "" if source == "any" else f".{source}"
     output = Path(out_dir) / f"{result.target_id}.remix{suffix}.mp4"
+    if captions is not None:
+        # Kept next to the video rather than in a temp dir: it is the one part of
+        # the output worth editing by hand and burning in again.
+        result.captions = _write_captions(
+            subtitle, output.with_suffix(".ass"), captions, on_progress
+        )
     if on_progress:
         on_progress("rendering")
     result.output = render(
-        matches, grabbed.video_path, output, library_root=Path(library_root)
+        matches,
+        grabbed.video_path,
+        output,
+        library_root=Path(library_root),
+        captions=result.captions,
     )
     return result

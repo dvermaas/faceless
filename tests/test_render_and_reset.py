@@ -110,6 +110,77 @@ def test_original_audio_is_mapped_from_the_source(tmp_path, fake_ffmpeg):
     assert "copy" in mux  # picture is copied, never re-encoded at the mux
 
 
+# -- burned-in captions --------------------------------------------------
+
+
+@pytest.fixture
+def staged_clip(tmp_path) -> Path:
+    clip_path = tmp_path / "clips" / "lion-resting__pexels-1.mp4"
+    clip_path.parent.mkdir(parents=True)
+    clip_path.write_bytes(b"fake")
+    return clip_path
+
+
+def test_captions_are_burned_in_at_the_mux(tmp_path, fake_ffmpeg, staged_clip):
+    ass = tmp_path / "captions.ass"
+    ass.write_text("[Events]\n", encoding="utf-8")
+
+    render.render(
+        [_match(0, 3.0)],
+        tmp_path / "audio.mp4",
+        tmp_path / "out.mp4",
+        library_root=tmp_path,
+        captions=ass,
+    )
+    mux = fake_ffmpeg[-1]
+    assert "subtitles=captions.ass" in mux
+    # Drawing on the picture means it has to be encoded again, not copied.
+    assert "libx264" in mux and "copy" not in mux
+
+
+def test_the_caption_file_is_handed_to_ffmpeg_by_bare_name(tmp_path, fake_ffmpeg, staged_clip):
+    """A Windows absolute path inside a filtergraph needs its drive colon escaped."""
+    ass = tmp_path / "captions.ass"
+    ass.write_text("[Events]\n", encoding="utf-8")
+
+    render.render(
+        [_match(0, 3.0)],
+        tmp_path / "audio.mp4",
+        tmp_path / "out.mp4",
+        library_root=tmp_path,
+        captions=ass,
+    )
+    filtergraph = next(arg for arg in fake_ffmpeg[-1] if arg.startswith("subtitles="))
+    assert filtergraph == "subtitles=captions.ass"
+    assert str(tmp_path) not in filtergraph
+
+
+def test_output_paths_stay_absolute_for_the_mux(tmp_path, fake_ffmpeg, staged_clip, monkeypatch):
+    """The mux runs from the temp dir, so a relative output would land there."""
+    monkeypatch.chdir(tmp_path)
+    ass = tmp_path / "captions.ass"
+    ass.write_text("[Events]\n", encoding="utf-8")
+
+    render.render(
+        [_match(0, 3.0)],
+        Path("audio.mp4"),
+        Path("remixes/out.mp4"),
+        library_root=tmp_path,
+        captions=ass,
+    )
+    mux = fake_ffmpeg[-1]
+    assert Path(mux[-1]).is_absolute()
+    assert Path(mux[mux.index("-i") + 1]).is_absolute()
+
+
+def test_the_returned_path_is_the_one_the_caller_asked_for(tmp_path, fake_ffmpeg, staged_clip):
+    """Resolving paths for ffmpeg must not change what gets printed back."""
+    output = render.render(
+        [_match(0, 3.0)], tmp_path / "audio.mp4", tmp_path / "out.mp4", library_root=tmp_path
+    )
+    assert output == tmp_path / "out.mp4"
+
+
 # -- reset --------------------------------------------------------------
 
 

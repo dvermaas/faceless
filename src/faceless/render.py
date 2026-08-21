@@ -15,8 +15,8 @@ class RenderError(RuntimeError):
     """Raised when ffmpeg cannot produce the output."""
 
 
-def _run(command: list[str], what: str) -> None:
-    result = subprocess.run(command, capture_output=True, text=True)
+def _run(command: list[str], what: str, cwd: Path | None = None) -> None:
+    result = subprocess.run(command, capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:
         raise RenderError(f"ffmpeg failed {what}: {result.stderr[-400:]}")
 
@@ -54,12 +54,15 @@ def render(
     output: Path,
     *,
     library_root: Path,
+    captions: Path | None = None,
 ) -> Path:
     """Concatenate the matched clips and lay the original audio over them.
 
     Segments tile the source video exactly, so the concatenated picture is the
     same length as the audio - no padding or stretching is needed to keep them
-    together.
+    together. That is also what lets `captions` be timed against the *source*
+    and still land on the right frame here: output time and source time are the
+    same clock.
     """
     usable = [match for match in matches if match.clip]
     if not usable:
@@ -76,6 +79,12 @@ def render(
         )
 
     output.parent.mkdir(parents=True, exist_ok=True)
+    # The mux runs with its working directory inside the temp dir (see below),
+    # so the paths handed to ffmpeg have to be absolute by then: a relative
+    # `remixes/x.mp4` would otherwise be resolved against the temp dir, where
+    # `remixes` does not exist. `output` itself stays as the caller wrote it,
+    # because that is what gets printed back to them.
+    destination, audio = output.resolve(), audio_source.resolve()
     workdir = Path(tempfile.mkdtemp(prefix="faceless-render-"))
     try:
         pieces: list[Path] = []
@@ -102,15 +111,33 @@ def render(
             "concatenating segments",
         )
 
+        # Burning captions means the picture has to be encoded again; without
+        # them it is copied through untouched, which is both faster and lossless.
+        if captions is None:
+            picture = ["-c:v", "copy"]
+        else:
+            # libass is handed a bare filename with ffmpeg's working directory
+            # set to the temp dir. A Windows absolute path inside a filtergraph
+            # needs its drive colon escaped twice over, and getting that wrong
+            # fails as "Unable to parse option value" a minute into the encode.
+            shutil.copyfile(captions, workdir / "captions.ass")
+            picture = [
+                "-vf", "subtitles=captions.ass",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+            ]  # fmt: skip
+
         _run(
             [
                 "ffmpeg", "-v", "error", "-nostdin",
-                "-i", str(silent), "-i", str(audio_source),
+                "-i", str(silent), "-i", str(audio),
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
-                "-movflags", "+faststart", "-y", str(output),
+                *picture,
+                "-c:a", "aac", "-b:a", "192k", "-shortest",
+                "-movflags", "+faststart", "-y", str(destination),
             ],  # fmt: skip
             "muxing the original audio",
+            cwd=workdir,
         )
         return output
     finally:

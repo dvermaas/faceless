@@ -10,6 +10,7 @@ from pathlib import Path
 from yt_dlp.utils import DownloadError
 
 from . import __version__
+from .captions import DEFAULT_FONT, DEFAULT_POSITION, DEFAULT_SIZE, CaptionError, CaptionStyle
 from .download import DEFAULT_LANGS, DEFAULT_TEMPLATE, GrabError, grab
 from .library import Library, LibraryError
 from .llm import DEFAULT_MODEL, LLMError
@@ -153,6 +154,21 @@ def cmd_harvest(args: argparse.Namespace) -> int:
     return 0 if result.added or result.skipped else 1
 
 
+def _caption_style(args: argparse.Namespace) -> CaptionStyle | None:
+    """Assemble the caption style, or None when captions were not asked for."""
+    if not args.captions:
+        return None
+    return CaptionStyle(
+        font=args.caption_font,
+        size=args.caption_size,
+        colour=args.caption_colour,
+        outline_colour=args.caption_outline,
+        position=args.caption_position,
+        uppercase=not args.caption_mixed_case,
+        pop=not args.no_caption_pop,
+    )
+
+
 def cmd_remix(args: argparse.Namespace) -> int:
     result = remix(
         args.url,
@@ -163,6 +179,7 @@ def cmd_remix(args: argparse.Namespace) -> int:
         model=args.model,
         dry_run=args.dry_run,
         source=args.source,
+        captions=_caption_style(args),
         client=_client(args),
         on_progress=_progress(args),
     )
@@ -185,6 +202,8 @@ def cmd_remix(args: argparse.Namespace) -> int:
         print("  credits (Pexels licence):")
         for credit in result.credits:
             print(f"    {credit['author']} - {credit['url']}")
+    if result.captions:
+        print(f"  captions  {result.captions}")
     if result.output:
         print(f"  output    {result.output}")
     elif args.dry_run:
@@ -502,6 +521,68 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the shot-by-shot plan and render nothing",
     )
+    captions_group = remix_cmd.add_argument_group(
+        "captions",
+        "Burn the target's own narration in one word at a time, timed to the "
+        "word. Ignored unless --captions is given.",
+    )
+    captions_group.add_argument(
+        "--captions",
+        action="store_true",
+        help="burn word-by-word captions into the output",
+    )
+    captions_group.add_argument(
+        "--caption-font",
+        default=DEFAULT_FONT,
+        metavar="NAME",
+        help=(
+            f"installed font family to set the words in (default: {DEFAULT_FONT}). "
+            "Arial Black and Segoe UI Black are the other safe heavy faces"
+        ),
+    )
+    captions_group.add_argument(
+        "--caption-size",
+        type=int,
+        default=DEFAULT_SIZE,
+        metavar="PX",
+        help=(
+            f"cap height in pixels against a 1080x1920 frame (default: {DEFAULT_SIZE}). "
+            "Words too wide to fit are scaled down individually"
+        ),
+    )
+    captions_group.add_argument(
+        "--caption-colour",
+        "--caption-color",
+        default="#FFFFFF",
+        metavar="#RRGGBB",
+        help="fill colour of the words (default: #FFFFFF)",
+    )
+    captions_group.add_argument(
+        "--caption-outline",
+        default="#000000",
+        metavar="#RRGGBB",
+        help="colour of the outline and drop shadow (default: #000000)",
+    )
+    captions_group.add_argument(
+        "--caption-position",
+        type=float,
+        default=DEFAULT_POSITION,
+        metavar="FRACTION",
+        help=(
+            "height of the words above the bottom edge, as a fraction of the "
+            f"frame (default: {DEFAULT_POSITION})"
+        ),
+    )
+    captions_group.add_argument(
+        "--caption-mixed-case",
+        action="store_true",
+        help="keep the transcript's own capitalisation instead of upper-casing",
+    )
+    captions_group.add_argument(
+        "--no-caption-pop",
+        action="store_true",
+        help="draw each word at a flat size instead of popping it in",
+    )
     remix_cmd.add_argument("--json", action="store_true", help="emit JSON describing the rebuild")
     remix_cmd.set_defaults(func=cmd_remix)
 
@@ -587,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
         PexelsError,
         LLMError,
         RenderError,
+        CaptionError,
         DownloadError,
     ) as exc:
         message = str(exc)
